@@ -216,6 +216,87 @@ describe('TaskRouter', () => {
       expect(submittedTask).to.have.property('type', 'curate')
     })
 
+    describe('reviewDisabled stamping', () => {
+      it('stamps reviewDisabled=true on TaskExecute when resolver returns true', async () => {
+        const routerWithResolver = new TaskRouter({
+          agentPool,
+          getAgentForProject,
+          isReviewDisabled: sandbox.stub().resolves(true),
+          projectRegistry,
+          projectRouter,
+          transport: transportHelper.transport,
+        })
+        routerWithResolver.setup()
+
+        const handler = transportHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
+        const request = makeTaskCreateRequest()
+        await handler!(request, 'client-1')
+
+        await new Promise((resolve) => { setTimeout(resolve, 10) })
+
+        const submittedTask = agentPool.submitTask.firstCall.args[0]
+        expect(submittedTask).to.have.property('reviewDisabled', true)
+      })
+
+      it('stamps reviewDisabled=false on TaskExecute when resolver returns false', async () => {
+        const routerWithResolver = new TaskRouter({
+          agentPool,
+          getAgentForProject,
+          isReviewDisabled: sandbox.stub().resolves(false),
+          projectRegistry,
+          projectRouter,
+          transport: transportHelper.transport,
+        })
+        routerWithResolver.setup()
+
+        const handler = transportHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
+        const request = makeTaskCreateRequest()
+        await handler!(request, 'client-1')
+
+        await new Promise((resolve) => { setTimeout(resolve, 10) })
+
+        const submittedTask = agentPool.submitTask.firstCall.args[0]
+        expect(submittedTask).to.have.property('reviewDisabled', false)
+      })
+
+      it('omits reviewDisabled from TaskExecute when no resolver is configured', async () => {
+        const handler = transportHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
+        const request = makeTaskCreateRequest()
+        await handler!(request, 'client-1')
+
+        await new Promise((resolve) => { setTimeout(resolve, 10) })
+
+        const submittedTask = agentPool.submitTask.firstCall.args[0]
+        expect(submittedTask).to.not.have.property('reviewDisabled')
+      })
+
+      it('stamps explicit reviewDisabled=false when resolver throws (fail-open with single concrete value)', async () => {
+        // Returning undefined here would re-introduce the daemon/agent divergence the
+        // snapshot is meant to prevent: daemon stamps no field → CurateLogHandler treats
+        // as enabled (`?? false`), but the agent process opens no ALS scope and may
+        // observe a different value from .brv/config.json. Stamping a concrete `false`
+        // keeps both sides aligned (review enabled, fail-open).
+        const routerWithResolver = new TaskRouter({
+          agentPool,
+          getAgentForProject,
+          isReviewDisabled: sandbox.stub().rejects(new Error('config read failed')),
+          projectRegistry,
+          projectRouter,
+          transport: transportHelper.transport,
+        })
+        routerWithResolver.setup()
+
+        const handler = transportHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
+        const request = makeTaskCreateRequest()
+        await handler!(request, 'client-1')
+
+        await new Promise((resolve) => { setTimeout(resolve, 10) })
+
+        const submittedTask = agentPool.submitTask.firstCall.args[0]
+        expect(submittedTask).to.have.property('reviewDisabled', false)
+      })
+    })
+
     it('should return same taskId for duplicate create (idempotent)', async () => {
       const handler = transportHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
       const request = makeTaskCreateRequest()
@@ -418,6 +499,170 @@ describe('TaskRouter', () => {
   })
 
   // ==========================================================================
+  // preDispatchCheck (ENG-2126 fix #4)
+  // ==========================================================================
+
+  describe('preDispatchCheck', () => {
+    it('dispatches to agent pool when check resolves eligible', async () => {
+      const preDispatchCheck = sandbox.stub().resolves({eligible: true})
+
+      router = new TaskRouter({
+        agentPool,
+        getAgentForProject,
+        preDispatchCheck,
+        projectRegistry,
+        projectRouter,
+        transport: transportHelper.transport,
+      })
+      router.setup()
+
+      const handler = transportHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
+      const request = makeTaskCreateRequest({type: 'dream'})
+      await handler!(request, 'client-1')
+
+      expect(preDispatchCheck.calledOnce, 'preDispatchCheck should be invoked').to.be.true
+      expect((agentPool.submitTask as SinonStub).calledOnce, 'eligible task should reach the agent pool').to.be.true
+    })
+
+    it('short-circuits to task:completed with skip reason when check resolves ineligible', async () => {
+      const preDispatchCheck = sandbox.stub().resolves({eligible: false, skipResult: 'Dream skipped: Queue not empty (2 tasks pending)'})
+
+      router = new TaskRouter({
+        agentPool,
+        getAgentForProject,
+        preDispatchCheck,
+        projectRegistry,
+        projectRouter,
+        transport: transportHelper.transport,
+      })
+      router.setup()
+
+      const handler = transportHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
+      const request = makeTaskCreateRequest({type: 'dream'})
+      await handler!(request, 'client-1')
+
+      // Agent pool never receives the task
+      expect((agentPool.submitTask as SinonStub).called, 'ineligible task must not reach the agent pool').to.be.false
+
+      // Client receives task:completed with the skip reason
+      const completedCall = (transportHelper.transport.sendTo as SinonStub).getCalls().find(
+        (c) => c.args[0] === 'client-1' && c.args[1] === TransportTaskEventNames.COMPLETED,
+      )
+      expect(completedCall, 'expected task:completed to be sent').to.exist
+      expect(completedCall!.args[2].result).to.equal('Dream skipped: Queue not empty (2 tasks pending)')
+      expect(completedCall!.args[2].taskId).to.equal(request.taskId)
+    })
+
+    it('falls through to dispatch when check throws (fail-open)', async () => {
+      const preDispatchCheck = sandbox.stub().rejects(new Error('state read failed'))
+
+      router = new TaskRouter({
+        agentPool,
+        getAgentForProject,
+        preDispatchCheck,
+        projectRegistry,
+        projectRouter,
+        transport: transportHelper.transport,
+      })
+      router.setup()
+
+      const handler = transportHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
+      const request = makeTaskCreateRequest({type: 'dream'})
+      await handler!(request, 'client-1')
+
+      // Errors in pre-check must not block dispatch — agent's own gate check is the fallback
+      expect((agentPool.submitTask as SinonStub).calledOnce, 'fail-open: task should still reach the agent').to.be.true
+    })
+
+    it('is skipped when no preDispatchCheck is configured', async () => {
+      // default router in beforeEach has no preDispatchCheck
+      const handler = transportHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
+      const request = makeTaskCreateRequest({type: 'dream'})
+      await handler!(request, 'client-1')
+
+      expect((agentPool.submitTask as SinonStub).calledOnce).to.be.true
+    })
+
+    it('does NOT decrement agentPool.activeTasks counter when pre-check skips (the task was never submitted)', async () => {
+      // Regression for Codex P1: handleTaskCompleted unconditionally calls
+      // agentPool.notifyTaskCompleted, which decrements activeTasks. For a
+      // pre-dispatch skip the task never reached the pool, so notifying would
+      // undercount real load and let drainQueue dispatch an extra queued task.
+      const preDispatchCheck = sandbox.stub().resolves({eligible: false, skipResult: 'Dream skipped: Queue not empty (3 tasks pending)'})
+
+      router = new TaskRouter({
+        agentPool,
+        getAgentForProject,
+        preDispatchCheck,
+        projectRegistry,
+        projectRouter,
+        transport: transportHelper.transport,
+      })
+      router.setup()
+
+      const handler = transportHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
+      const request = makeTaskCreateRequest({type: 'dream'})
+      await handler!(request, 'client-1')
+
+      expect(agentPool.notifyTaskCompleted.called, 'pre-check skip must not notify the agent pool').to.be.false
+    })
+
+    it('does NOT fire onTaskCompleted lifecycle hooks when pre-check skips', async () => {
+      // Regression for RyanNg #5: hooks that act on completed tasks (metrics,
+      // counters) should not see pre-check skips as completions.
+      const hookOnCompleted = sandbox.stub().resolves()
+      const preDispatchCheck = sandbox.stub().resolves({eligible: false, skipResult: 'Dream skipped: Queue not empty (1 task pending)'})
+      const hookHelper = makeStubTransportServer(sandbox)
+
+      const routerWithHooks = new TaskRouter({
+        agentPool,
+        getAgentForProject,
+        lifecycleHooks: [{onTaskCompleted: hookOnCompleted}],
+        preDispatchCheck,
+        projectRegistry,
+        projectRouter,
+        transport: hookHelper.transport,
+      })
+      routerWithHooks.setup()
+
+      const handler = hookHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
+      const request = makeTaskCreateRequest({type: 'dream'})
+      await handler!(request, 'client-1')
+
+      // Allow async hook chain to flush
+      await new Promise((resolve) => {
+        setTimeout(resolve, 10)
+      })
+
+      expect(hookOnCompleted.called, 'onTaskCompleted must not fire for pre-check skips').to.be.false
+    })
+
+    it('still broadcasts task:completed to the project room on pre-check skip (so REPL/TUI see it)', async () => {
+      const preDispatchCheck = sandbox.stub().resolves({eligible: false, skipResult: 'Dream skipped: Queue not empty (1 task pending)'})
+
+      router = new TaskRouter({
+        agentPool,
+        getAgentForProject,
+        preDispatchCheck,
+        projectRegistry,
+        projectRouter,
+        transport: transportHelper.transport,
+      })
+      router.setup()
+
+      const handler = transportHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
+      const request = makeTaskCreateRequest({type: 'dream'})
+      await handler!(request, 'client-1')
+
+      const broadcastCall = projectRouter.broadcastToProject.getCalls().find(
+        (c) => c.args[1] === TransportTaskEventNames.COMPLETED,
+      )
+      expect(broadcastCall, 'project room should still see task:completed for skips').to.exist
+      expect(broadcastCall!.args[2].result).to.equal('Dream skipped: Queue not empty (1 task pending)')
+    })
+  })
+
+  // ==========================================================================
   // Task Lifecycle
   // ==========================================================================
 
@@ -493,6 +738,22 @@ describe('TaskRouter', () => {
       handler!({error: {message: 'fail', name: 'Error'}, taskId}, 'agent-1')
 
       expect(agentPool.notifyTaskCompleted.calledWith('/app')).to.be.true
+    })
+
+    it('should notify agentPool on task:completed for daemon-submitted tasks', () => {
+      const handler = transportHelper.requestHandlers.get(TransportTaskEventNames.COMPLETED)
+
+      handler!({projectPath: '/daemon-app', result: 'done', taskId: 'daemon-task'}, 'agent-1')
+
+      expect(agentPool.notifyTaskCompleted.calledWith('/daemon-app')).to.be.true
+    })
+
+    it('should notify agentPool on task:error for daemon-submitted tasks', () => {
+      const handler = transportHelper.requestHandlers.get(TransportTaskEventNames.ERROR)
+
+      handler!({error: {message: 'fail', name: 'Error'}, projectPath: '/daemon-app', taskId: 'daemon-task'}, 'agent-1')
+
+      expect(agentPool.notifyTaskCompleted.calledWith('/daemon-app')).to.be.true
     })
 
     it('should route task:cancelled to client and broadcast', () => {
@@ -983,6 +1244,125 @@ describe('TaskRouter', () => {
       for (const task of tasks) {
         expect(task.projectPath).to.be.undefined
       }
+    })
+  })
+
+  // ==========================================================================
+  // task:list (snapshot for web UI)
+  // ==========================================================================
+
+  describe('task:list', () => {
+    it('should register a handler for task:list', () => {
+      const handler = transportHelper.requestHandlers.get(TransportTaskEventNames.LIST)
+      expect(handler).to.exist
+    })
+
+    it('should return active tasks for the requested project (and unassigned)', async () => {
+      const createHandler = transportHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
+      const appTaskId = randomUUID()
+      const otherTaskId = randomUUID()
+      const unassignedTaskId = randomUUID()
+      createHandler!(makeTaskCreateRequest({projectPath: '/app', taskId: appTaskId}), 'client-1')
+      createHandler!(makeTaskCreateRequest({projectPath: '/other', taskId: otherTaskId}), 'client-2')
+      createHandler!(makeTaskCreateRequest({projectPath: undefined, taskId: unassignedTaskId}), 'client-3')
+
+      const listHandler = transportHelper.requestHandlers.get(TransportTaskEventNames.LIST)
+      const result = (await listHandler!({projectPath: '/app'}, 'client-1')) as {
+        tasks: Array<{projectPath?: string; status: string; taskId: string; type: string}>
+      }
+
+      const ids = result.tasks.map((t) => t.taskId)
+      expect(ids).to.include(appTaskId)
+      expect(ids).to.include(unassignedTaskId)
+      expect(ids).to.not.include(otherTaskId)
+      const appTask = result.tasks.find((t) => t.taskId === appTaskId)
+      expect(appTask).to.have.property('status', 'created')
+      expect(appTask).to.have.property('type', 'curate')
+    })
+
+    it('should reflect started status after task:started', async () => {
+      const createHandler = transportHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
+      const startedHandler = transportHelper.requestHandlers.get(TransportTaskEventNames.STARTED)
+      const taskId = randomUUID()
+      createHandler!(makeTaskCreateRequest({projectPath: '/app', taskId}), 'client-1')
+      startedHandler!({taskId}, 'agent-1')
+
+      const listHandler = transportHelper.requestHandlers.get(TransportTaskEventNames.LIST)
+      const result = (await listHandler!({projectPath: '/app'}, 'client-1')) as {
+        tasks: Array<{startedAt?: number; status: string; taskId: string}>
+      }
+      const item = result.tasks.find((t) => t.taskId === taskId)
+      expect(item).to.exist
+      expect(item!.status).to.equal('started')
+      expect(item!.startedAt).to.be.a('number')
+    })
+
+    it('should include recently completed tasks (within grace period)', async () => {
+      const createHandler = transportHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
+      const completedHandler = transportHelper.requestHandlers.get(TransportTaskEventNames.COMPLETED)
+      const taskId = randomUUID()
+      createHandler!(makeTaskCreateRequest({projectPath: '/app', taskId}), 'client-1')
+      completedHandler!({result: 'done', taskId}, 'agent-1')
+
+      const listHandler = transportHelper.requestHandlers.get(TransportTaskEventNames.LIST)
+      const result = (await listHandler!({projectPath: '/app'}, 'client-1')) as {
+        tasks: Array<{completedAt?: number; result?: string; status: string; taskId: string}>
+      }
+      const item = result.tasks.find((t) => t.taskId === taskId)
+      expect(item).to.exist
+      expect(item!.status).to.equal('completed')
+      expect(item!.result).to.equal('done')
+      expect(item!.completedAt).to.be.a('number')
+    })
+
+    it("should default to caller's registered project when projectPath omitted", async () => {
+      const createHandler = transportHelper.requestHandlers.get(TransportTaskEventNames.CREATE)
+      const taskId = randomUUID()
+      createHandler!(makeTaskCreateRequest({projectPath: '/app', taskId}), 'client-1')
+
+      // Wire up resolveClientProjectPath via a fresh router so we can return /app for client-1
+      const helper = makeStubTransportServer(sandbox)
+      const localRouter = new TaskRouter({
+        agentPool,
+        getAgentForProject,
+        projectRegistry,
+        projectRouter,
+        resolveClientProjectPath: (id) => (id === 'client-1' ? '/app' : undefined),
+        transport: helper.transport,
+      })
+      localRouter.setup()
+      const localCreate = helper.requestHandlers.get(TransportTaskEventNames.CREATE)
+      const localTaskId = randomUUID()
+      localCreate!(makeTaskCreateRequest({projectPath: '/app', taskId: localTaskId}), 'client-1')
+
+      const listHandler = helper.requestHandlers.get(TransportTaskEventNames.LIST)
+      const result = (await listHandler!({}, 'client-1')) as {tasks: Array<{taskId: string}>}
+      const ids = result.tasks.map((t) => t.taskId)
+      expect(ids).to.include(localTaskId)
+      expect(ids).to.not.include(taskId)
+    })
+
+    it('should return an empty list when projectFilter cannot be resolved', async () => {
+      // Fresh router with NO resolveClientProjectPath wired up — so when the
+      // request omits projectPath, projectFilter ends up undefined and the
+      // handler must NOT leak every task across projects.
+      const helper = makeStubTransportServer(sandbox)
+      const localRouter = new TaskRouter({
+        agentPool,
+        getAgentForProject,
+        projectRegistry,
+        projectRouter,
+        transport: helper.transport,
+      })
+      localRouter.setup()
+
+      const localCreate = helper.requestHandlers.get(TransportTaskEventNames.CREATE)
+      localCreate!(makeTaskCreateRequest({projectPath: '/app', taskId: randomUUID()}), 'client-1')
+      localCreate!(makeTaskCreateRequest({projectPath: '/other', taskId: randomUUID()}), 'client-2')
+
+      const listHandler = helper.requestHandlers.get(TransportTaskEventNames.LIST)
+      const result = await listHandler!({}, 'unknown-client')
+      expect(result).to.deep.equal({tasks: []})
     })
   })
 

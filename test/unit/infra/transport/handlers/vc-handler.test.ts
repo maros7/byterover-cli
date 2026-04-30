@@ -22,7 +22,7 @@ import type {
 } from '../../../../../src/server/core/interfaces/transport/i-transport-server.js'
 import type {IVcGitConfigStore} from '../../../../../src/server/core/interfaces/vc/i-vc-git-config-store.js'
 
-import {BRV_DIR, CONTEXT_TREE_DIR, CONTEXT_TREE_GITIGNORE} from '../../../../../src/server/constants.js'
+import {BRV_DIR, CONTEXT_TREE_DIR} from '../../../../../src/server/constants.js'
 import {AuthToken} from '../../../../../src/server/core/domain/entities/auth-token.js'
 import {BrvConfig} from '../../../../../src/server/core/domain/entities/brv-config.js'
 import {GitAuthError, GitError} from '../../../../../src/server/core/domain/errors/git-error.js'
@@ -90,16 +90,21 @@ function makeDeps(sandbox: SinonSandbox, projectPath: string): TestDeps {
     deleteBranch: sandbox.stub().resolves(),
     fetch: sandbox.stub().resolves(),
     getAheadBehind: sandbox.stub().resolves({ahead: 0, behind: 0}),
+    getBlobContent: sandbox.stub().resolves(),
+    getBlobContents: sandbox.stub().resolves({}),
     getConflicts: sandbox.stub().resolves([]),
     getCurrentBranch: sandbox.stub().resolves('main'),
     getFilesWithConflictMarkers: sandbox.stub().resolves([]),
     getRemoteUrl: sandbox.stub().resolves(),
+    getTextBlob: sandbox.stub().resolves(),
     getTrackingBranch: sandbox.stub().resolves(),
+    hashBlob: sandbox.stub().resolves('0000000'),
     init: sandbox.stub().resolves(),
     isAncestor: sandbox.stub().resolves(true),
     isEmptyRepository: sandbox.stub().resolves(false),
     isInitialized: sandbox.stub().resolves(true),
     listBranches: sandbox.stub().resolves([]),
+    listChangedFiles: sandbox.stub().resolves([]),
     listRemotes: sandbox.stub().resolves([{remote: 'origin', url: 'https://example.com/repo.git'}]),
     log: sandbox.stub().resolves([]),
     merge: sandbox.stub().resolves({success: true}),
@@ -204,11 +209,23 @@ function makeVcHandler(deps: TestDeps): VcHandler {
 
 function stubDefaultTeamSpace(deps: TestDeps): void {
   deps.teamService.getTeams.resolves({
-    teams: [{displayName: 'Teambao1', id: 'tid-1', isActive: true, isDefault: false, name: 'teambao1', slug: 'teambao1'}],
+    teams: [
+      {displayName: 'Teambao1', id: 'tid-1', isActive: true, isDefault: false, name: 'teambao1', slug: 'teambao1'},
+    ],
     total: 1,
   })
   deps.spaceService.getSpaces.resolves({
-    spaces: [{id: 'sid-1', isDefault: false, name: 'test-space', slug: 'test-space', teamId: 'tid-1', teamName: 'teambao1', teamSlug: 'teambao1'}],
+    spaces: [
+      {
+        id: 'sid-1',
+        isDefault: false,
+        name: 'test-space',
+        slug: 'test-space',
+        teamId: 'tid-1',
+        teamName: 'teambao1',
+        teamSlug: 'teambao1',
+      },
+    ],
     total: 1,
   })
 }
@@ -340,30 +357,17 @@ describe('VcHandler', () => {
       expect(deps.gitService.addRemote.called).to.be.false
     })
 
-    it('should write .gitignore to context tree directory', async () => {
+    it('should complete init successfully', async () => {
       const deps = makeDeps(sandbox, projectPath)
       deps.gitService.isInitialized.resolves(false)
       makeVcHandler(deps).setup()
 
-      await deps.requestHandlers[VcEvents.INIT]({}, CLIENT_ID)
+      const result = await deps.requestHandlers[VcEvents.INIT]({}, CLIENT_ID)
 
-      const writeFileStub = fs.promises.writeFile as SinonStub
-      expect(writeFileStub.calledOnce).to.be.true
-      expect(writeFileStub.firstCall.args[0]).to.equal(join(deps.contextTreeDirPath, '.gitignore'))
-      expect(writeFileStub.firstCall.args[1]).to.equal(CONTEXT_TREE_GITIGNORE)
-      expect(writeFileStub.firstCall.args[2]).to.equal('utf8')
-    })
-
-    it('should not overwrite existing .gitignore', async () => {
-      const deps = makeDeps(sandbox, projectPath)
-      deps.gitService.isInitialized.resolves(false)
-      sandbox.stub(fs.promises, 'access').resolves()
-      makeVcHandler(deps).setup()
-
-      await deps.requestHandlers[VcEvents.INIT]({}, CLIENT_ID)
-
-      const writeFileStub = fs.promises.writeFile as SinonStub
-      expect(writeFileStub.called).to.be.false
+      expect(result).to.deep.equal({
+        gitDir: join(deps.contextTreeDirPath, '.git'),
+        reinitialized: false,
+      })
     })
   })
 
@@ -389,18 +393,6 @@ describe('VcHandler', () => {
         gitDir: join(deps.contextTreeDirPath, '.git'),
         reinitialized: true,
       })
-    })
-
-    it('should write .gitignore on reinit', async () => {
-      const deps = makeDeps(sandbox, projectPath)
-      deps.gitService.isInitialized.resolves(true)
-      makeVcHandler(deps).setup()
-
-      await deps.requestHandlers[VcEvents.INIT]({}, CLIENT_ID)
-
-      const writeFileStub = fs.promises.writeFile as SinonStub
-      expect(writeFileStub.calledOnce).to.be.true
-      expect(writeFileStub.firstCall.args[0]).to.equal(join(deps.contextTreeDirPath, '.gitignore'))
     })
   })
 
@@ -772,6 +764,54 @@ describe('VcHandler', () => {
           expect(error.code).to.equal(VcErrorCode.GIT_NOT_INITIALIZED)
         }
       }
+    })
+
+    it('should throw VcError MERGE_CONFLICT when index has unmerged entries', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.isInitialized.resolves(true)
+      deps.gitService.status.resolves({
+        files: [{path: 'a.md', staged: true, status: 'modified'}],
+        isClean: false,
+      })
+      deps.gitService.getConflicts.resolves([{path: 'a.md', type: 'both_modified'}])
+      makeVcHandler(deps).setup()
+
+      try {
+        await deps.requestHandlers[VcEvents.COMMIT]({message: 'test'}, CLIENT_ID)
+        expect.fail('Expected error')
+      } catch (error) {
+        expect(error).to.be.instanceOf(VcError)
+        if (error instanceof VcError) {
+          expect(error.code).to.equal(VcErrorCode.MERGE_CONFLICT)
+        }
+      }
+
+      expect(deps.gitService.commit.called).to.be.false
+    })
+
+    it('should throw VcError CONFLICT_MARKERS_PRESENT when staged file still has markers', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.isInitialized.resolves(true)
+      deps.gitService.status.resolves({
+        files: [{path: 'a.md', staged: true, status: 'modified'}],
+        isClean: false,
+      })
+      deps.gitService.getConflicts.resolves([])
+      deps.gitService.getFilesWithConflictMarkers.resolves(['a.md'])
+      makeVcHandler(deps).setup()
+
+      try {
+        await deps.requestHandlers[VcEvents.COMMIT]({message: 'test'}, CLIENT_ID)
+        expect.fail('Expected error')
+      } catch (error) {
+        expect(error).to.be.instanceOf(VcError)
+        if (error instanceof VcError) {
+          expect(error.code).to.equal(VcErrorCode.CONFLICT_MARKERS_PRESENT)
+          expect(error.message).to.include('a.md')
+        }
+      }
+
+      expect(deps.gitService.commit.called).to.be.false
     })
   })
 
@@ -1405,7 +1445,9 @@ describe('VcHandler', () => {
       deps.gitService.isInitialized.resolves(true)
       deps.gitService.listRemotes.resolves([{remote: 'origin', url: 'https://example.com/repo.git'}])
       deps.gitService.pull.rejects(
-        new GitError('Local changes would be overwritten by pull. Commit or discard your changes first.'),
+        new GitError(
+          'Your local changes would be overwritten by pull. Please commit or discard your changes before you pull.',
+        ),
       )
       deps.gitService.getTrackingBranch.resolves({remote: 'origin', remoteBranch: 'main'})
       makeVcHandler(deps).setup()
@@ -1418,6 +1460,34 @@ describe('VcHandler', () => {
         if (error instanceof VcError) {
           expect(error.code).to.equal(VcErrorCode.UNCOMMITTED_CHANGES)
           expect(error.message).to.include('would be overwritten')
+        }
+      }
+    })
+
+    it('should surface affected file paths in pull overwrite error', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.isInitialized.resolves(true)
+      deps.gitService.listRemotes.resolves([{remote: 'origin', url: 'https://example.com/repo.git'}])
+      deps.gitService.pull.rejects(
+        new GitError(
+          'Your local changes to the following files would be overwritten by pull:\n' +
+            '\ttracked.md\n' +
+            '\tnotes/log.md\n' +
+            'Please commit or discard your changes before you pull.',
+        ),
+      )
+      deps.gitService.getTrackingBranch.resolves({remote: 'origin', remoteBranch: 'main'})
+      makeVcHandler(deps).setup()
+
+      try {
+        await deps.requestHandlers[VcEvents.PULL]({}, CLIENT_ID)
+        expect.fail('Expected error')
+      } catch (error) {
+        expect(error).to.be.instanceOf(VcError)
+        if (error instanceof VcError) {
+          expect(error.code).to.equal(VcErrorCode.UNCOMMITTED_CHANGES)
+          expect(error.message).to.include('tracked.md')
+          expect(error.message).to.include('notes/log.md')
         }
       }
     })
@@ -1734,9 +1804,7 @@ describe('VcHandler', () => {
       expect(result.gitDir).to.include('.git')
       expect(deps.gitService.clone.calledOnce).to.be.true
       const cloneArgs = deps.gitService.clone.firstCall.args[0]
-      expect(cloneArgs.url).to.equal(
-        'https://byterover.dev/teambao1/test-space.git',
-      )
+      expect(cloneArgs.url).to.equal('https://byterover.dev/teambao1/test-space.git')
     })
 
     it('should strip credentials from URL when cloning', async () => {
@@ -1746,15 +1814,12 @@ describe('VcHandler', () => {
       stubDefaultTeamSpace(deps)
       makeVcHandler(deps).setup()
 
-      const fullUrl =
-        'https://uid:key@byterover.dev/teambao1/test-space.git'
+      const fullUrl = 'https://uid:key@byterover.dev/teambao1/test-space.git'
       await invoke(deps, VcEvents.CLONE, {url: fullUrl})
 
       // Credentials stripped — clean URL used for clone (auth via headers)
       const cloneArgs = deps.gitService.clone.firstCall.args[0]
-      expect(cloneArgs.url).to.equal(
-        'https://byterover.dev/teambao1/test-space.git',
-      )
+      expect(cloneArgs.url).to.equal('https://byterover.dev/teambao1/test-space.git')
     })
 
     it('should clone with names in URL by resolving team/space names', async () => {
@@ -1762,11 +1827,23 @@ describe('VcHandler', () => {
       deps.gitService.isInitialized.resolves(false)
       deps.tokenStore.load.resolves(validToken)
       deps.teamService.getTeams.resolves({
-        teams: [{displayName: 'Teambao1', id: 'tid-1', isActive: true, isDefault: false, name: 'Teambao1', slug: 'teambao1'}],
+        teams: [
+          {displayName: 'Teambao1', id: 'tid-1', isActive: true, isDefault: false, name: 'Teambao1', slug: 'teambao1'},
+        ],
         total: 1,
       })
       deps.spaceService.getSpaces.resolves({
-        spaces: [{id: 'sid-1', isDefault: false, name: 'test-git', slug: 'test-git', teamId: 'tid-1', teamName: 'Teambao1', teamSlug: 'teambao1'}],
+        spaces: [
+          {
+            id: 'sid-1',
+            isDefault: false,
+            name: 'test-git',
+            slug: 'test-git',
+            teamId: 'tid-1',
+            teamName: 'Teambao1',
+            teamSlug: 'teambao1',
+          },
+        ],
         total: 1,
       })
       makeVcHandler(deps).setup()
@@ -1791,7 +1868,17 @@ describe('VcHandler', () => {
         total: 1,
       })
       deps.spaceService.getSpaces.resolves({
-        spaces: [{id: 'sid-1', isDefault: false, name: 'project', slug: 'project', teamId: 'tid-1', teamName: 'acme', teamSlug: 'acme'}],
+        spaces: [
+          {
+            id: 'sid-1',
+            isDefault: false,
+            name: 'project',
+            slug: 'project',
+            teamId: 'tid-1',
+            teamName: 'acme',
+            teamSlug: 'acme',
+          },
+        ],
         total: 1,
       })
       makeVcHandler(deps).setup()
@@ -1812,11 +1899,23 @@ describe('VcHandler', () => {
       deps.gitService.isInitialized.resolves(false)
       deps.tokenStore.load.resolves(validToken)
       deps.teamService.getTeams.resolves({
-        teams: [{displayName: 'Teambao1', id: 'tid-1', isActive: true, isDefault: false, name: 'Teambao1', slug: 'teambao1'}],
+        teams: [
+          {displayName: 'Teambao1', id: 'tid-1', isActive: true, isDefault: false, name: 'Teambao1', slug: 'teambao1'},
+        ],
         total: 1,
       })
       deps.spaceService.getSpaces.resolves({
-        spaces: [{id: 'sid-1', isDefault: false, name: 'test-git', slug: 'test-git', teamId: 'tid-1', teamName: 'Teambao1', teamSlug: 'teambao1'}],
+        spaces: [
+          {
+            id: 'sid-1',
+            isDefault: false,
+            name: 'test-git',
+            slug: 'test-git',
+            teamId: 'tid-1',
+            teamName: 'Teambao1',
+            teamSlug: 'teambao1',
+          },
+        ],
         total: 1,
       })
       makeVcHandler(deps).setup()
@@ -1838,7 +1937,17 @@ describe('VcHandler', () => {
         total: 1,
       })
       deps.spaceService.getSpaces.resolves({
-        spaces: [{id: 'sid-1', isDefault: false, name: 'project', slug: 'project', teamId: 'tid-1', teamName: 'acme', teamSlug: 'acme'}],
+        spaces: [
+          {
+            id: 'sid-1',
+            isDefault: false,
+            name: 'project',
+            slug: 'project',
+            teamId: 'tid-1',
+            teamName: 'acme',
+            teamSlug: 'acme',
+          },
+        ],
         total: 1,
       })
       makeVcHandler(deps).setup()
@@ -1898,11 +2007,30 @@ describe('VcHandler', () => {
       deps.gitService.isInitialized.resolves(false)
       deps.tokenStore.load.resolves(validToken)
       deps.teamService.getTeams.resolves({
-        teams: [{displayName: 'Test Release 2.0.0', id: 'tid-1', isActive: true, isDefault: false, name: 'test-release-2.0.0', slug: 'test-release-2-0-0'}],
+        teams: [
+          {
+            displayName: 'Test Release 2.0.0',
+            id: 'tid-1',
+            isActive: true,
+            isDefault: false,
+            name: 'test-release-2.0.0',
+            slug: 'test-release-2-0-0',
+          },
+        ],
         total: 1,
       })
       deps.spaceService.getSpaces.resolves({
-        spaces: [{id: 'sid-1', isDefault: false, name: 'normal-space', slug: 'normal-space', teamId: 'tid-1', teamName: 'test-release-2.0.0', teamSlug: 'test-release-2-0-0'}],
+        spaces: [
+          {
+            id: 'sid-1',
+            isDefault: false,
+            name: 'normal-space',
+            slug: 'normal-space',
+            teamId: 'tid-1',
+            teamName: 'test-release-2.0.0',
+            teamSlug: 'test-release-2-0-0',
+          },
+        ],
         total: 1,
       })
       makeVcHandler(deps).setup()
@@ -1926,7 +2054,17 @@ describe('VcHandler', () => {
         total: 1,
       })
       deps.spaceService.getSpaces.resolves({
-        spaces: [{id: 'sid-1', isDefault: false, name: 'my-space-v2.0', slug: 'my-space-v2-0', teamId: 'tid-1', teamName: 'acme', teamSlug: 'acme'}],
+        spaces: [
+          {
+            id: 'sid-1',
+            isDefault: false,
+            name: 'my-space-v2.0',
+            slug: 'my-space-v2-0',
+            teamId: 'tid-1',
+            teamName: 'acme',
+            teamSlug: 'acme',
+          },
+        ],
         total: 1,
       })
       makeVcHandler(deps).setup()
@@ -2041,40 +2179,19 @@ describe('VcHandler', () => {
       expect(deps.gitService.isEmptyRepository.called).to.be.false
     })
 
-    it('should write .gitignore after successful clone', async () => {
+    it('should complete clone successfully', async () => {
       const deps = makeDeps(sandbox, projectPath)
       deps.gitService.isInitialized.resolves(false)
       deps.tokenStore.load.resolves(validToken)
       stubDefaultTeamSpace(deps)
       makeVcHandler(deps).setup()
 
-      await invoke(deps, VcEvents.CLONE, {
+      const result = await invoke(deps, VcEvents.CLONE, {
         url: 'https://byterover.dev/teambao1/test-space.git',
       })
 
-      const writeFileStub = fs.promises.writeFile as SinonStub
-      expect(writeFileStub.calledOnce).to.be.true
-      expect(writeFileStub.firstCall.args[0]).to.equal(join(deps.contextTreeDirPath, '.gitignore'))
-      expect(writeFileStub.firstCall.args[1]).to.equal(CONTEXT_TREE_GITIGNORE)
-    })
-
-    it('should not write .gitignore when clone fails', async () => {
-      const deps = makeDeps(sandbox, projectPath)
-      deps.gitService.isInitialized.resolves(false)
-      deps.tokenStore.load.resolves(validToken)
-      stubDefaultTeamSpace(deps)
-      deps.gitService.clone.rejects(new Error('network error'))
-      makeVcHandler(deps).setup()
-
-      try {
-        await invoke(deps, VcEvents.CLONE, {
-          url: 'https://byterover.dev/teambao1/test-space.git',
-        })
-        expect.fail('Expected error')
-      } catch {
-        const writeFileStub = fs.promises.writeFile as SinonStub
-        expect(writeFileStub.called).to.be.false
-      }
+      expect(result).to.have.property('gitDir')
+      expect(deps.gitService.clone.calledOnce).to.be.true
     })
 
     it('should throw VcError NETWORK_ERROR when clone fails with HttpError', async () => {
@@ -2167,10 +2284,8 @@ describe('VcHandler', () => {
       stubDefaultTeamSpace(deps)
       makeVcHandler(deps).setup()
 
-      const url =
-        'https://user:token@byterover.dev/teambao1/test-space.git'
-      const expectedCleanUrl =
-        'https://byterover.dev/teambao1/test-space.git'
+      const url = 'https://user:token@byterover.dev/teambao1/test-space.git'
+      const expectedCleanUrl = 'https://byterover.dev/teambao1/test-space.git'
       const result = await deps.requestHandlers[VcEvents.REMOTE]({subcommand: 'add', url}, CLIENT_ID)
       expect(result).to.deep.equal({action: 'add', url: expectedCleanUrl})
       expect(deps.gitService.addRemote.calledOnce).to.be.true
@@ -2193,8 +2308,7 @@ describe('VcHandler', () => {
       stubDefaultTeamSpace(deps)
       makeVcHandler(deps).setup()
 
-      const cleanUrl =
-        'https://byterover.dev/teambao1/test-space.git'
+      const cleanUrl = 'https://byterover.dev/teambao1/test-space.git'
       const result = await invoke<{action: string; url: string}>(
         deps,
         VcEvents.REMOTE,
@@ -2228,7 +2342,17 @@ describe('VcHandler', () => {
         total: 1,
       })
       deps.spaceService.getSpaces.resolves({
-        spaces: [{id: 'sid-1', isDefault: false, name: 'project', slug: 'project', teamId: 'tid-1', teamName: 'acme', teamSlug: 'acme'}],
+        spaces: [
+          {
+            id: 'sid-1',
+            isDefault: false,
+            name: 'project',
+            slug: 'project',
+            teamId: 'tid-1',
+            teamName: 'acme',
+            teamSlug: 'acme',
+          },
+        ],
         total: 1,
       })
       makeVcHandler(deps).setup()
@@ -2310,8 +2434,7 @@ describe('VcHandler', () => {
       stubDefaultTeamSpace(deps)
       makeVcHandler(deps).setup()
 
-      const url =
-        'https://byterover.dev/teambao1/test-space.git'
+      const url = 'https://byterover.dev/teambao1/test-space.git'
       const result = await deps.requestHandlers[VcEvents.REMOTE]({subcommand: 'set-url', url}, CLIENT_ID)
       expect(result).to.deep.equal({action: 'set-url', url})
       expect(deps.gitService.removeRemote.calledOnce).to.be.true
@@ -2370,7 +2493,17 @@ describe('VcHandler', () => {
         total: 1,
       })
       deps.spaceService.getSpaces.resolves({
-        spaces: [{id: 'sid-1', isDefault: false, name: 'project', slug: 'project', teamId: 'tid-1', teamName: 'acme', teamSlug: 'acme'}],
+        spaces: [
+          {
+            id: 'sid-1',
+            isDefault: false,
+            name: 'project',
+            slug: 'project',
+            teamId: 'tid-1',
+            teamName: 'acme',
+            teamSlug: 'acme',
+          },
+        ],
         total: 1,
       })
       makeVcHandler(deps).setup()
@@ -2405,7 +2538,17 @@ describe('VcHandler', () => {
         total: 1,
       })
       deps.spaceService.getSpaces.resolves({
-        spaces: [{id: 'sid-1', isDefault: false, name: 'project', slug: 'project', teamId: 'tid-1', teamName: 'acme', teamSlug: 'acme'}],
+        spaces: [
+          {
+            id: 'sid-1',
+            isDefault: false,
+            name: 'project',
+            slug: 'project',
+            teamId: 'tid-1',
+            teamName: 'acme',
+            teamSlug: 'acme',
+          },
+        ],
         total: 1,
       })
       makeVcHandler(deps).setup()
@@ -2423,6 +2566,181 @@ describe('VcHandler', () => {
       expect(writtenConfig.teamName).to.equal('acme')
     })
 
+    it('should call gitService.removeRemote and return {action: remove} when remote exists', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.isInitialized.resolves(true)
+      deps.gitService.getRemoteUrl.resolves('https://byterover.dev/acme/project.git')
+      makeVcHandler(deps).setup()
+
+      const result = await deps.requestHandlers[VcEvents.REMOTE]({subcommand: 'remove'}, CLIENT_ID)
+      expect(result).to.deep.equal({action: 'remove'})
+      expect(deps.gitService.removeRemote.calledOnce).to.be.true
+      expect(deps.gitService.removeRemote.firstCall.args[0]).to.include({remote: 'origin'})
+    })
+
+    it('should clear space fields from config.json via withoutSpace() on remove', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.isInitialized.resolves(true)
+      deps.gitService.getRemoteUrl.resolves('https://byterover.dev/acme/project.git')
+      const boundConfig = new BrvConfig({
+        createdAt: '2025-01-01T00:00:00.000Z',
+        cwd: projectPath,
+        spaceId: 'sid-1',
+        spaceName: 'project',
+        teamId: 'tid-1',
+        teamName: 'acme',
+        version: '1.0.0',
+      })
+      deps.projectConfigStore.read.resolves(boundConfig)
+      makeVcHandler(deps).setup()
+
+      await deps.requestHandlers[VcEvents.REMOTE]({subcommand: 'remove'}, CLIENT_ID)
+
+      expect(deps.projectConfigStore.write.calledOnce).to.be.true
+      const writtenConfig: BrvConfig = deps.projectConfigStore.write.firstCall.args[0]
+      expect(writtenConfig.spaceId).to.be.undefined
+      expect(writtenConfig.spaceName).to.be.undefined
+      expect(writtenConfig.teamId).to.be.undefined
+      expect(writtenConfig.teamName).to.be.undefined
+      expect(writtenConfig.cwd).to.equal(projectPath)
+    })
+
+    it('should clear orphaned space fields even when config is not fully cloud-connected', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.isInitialized.resolves(true)
+      deps.gitService.getRemoteUrl.resolves('https://byterover.dev/acme/project.git')
+      const partialConfig = new BrvConfig({
+        createdAt: '2025-01-01T00:00:00.000Z',
+        cwd: projectPath,
+        spaceId: 'orphaned-sid',
+        version: '1.0.0',
+      })
+      deps.projectConfigStore.read.resolves(partialConfig)
+      makeVcHandler(deps).setup()
+
+      await deps.requestHandlers[VcEvents.REMOTE]({subcommand: 'remove'}, CLIENT_ID)
+
+      expect(deps.projectConfigStore.write.calledOnce).to.be.true
+      const writtenConfig: BrvConfig = deps.projectConfigStore.write.firstCall.args[0]
+      expect(writtenConfig.spaceId).to.be.undefined
+      expect(writtenConfig.cwd).to.equal(projectPath)
+    })
+
+    it('should skip config-store write when config does not exist', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.isInitialized.resolves(true)
+      deps.gitService.getRemoteUrl.resolves('https://byterover.dev/acme/project.git')
+      deps.projectConfigStore.read.resolves()
+      makeVcHandler(deps).setup()
+
+      await deps.requestHandlers[VcEvents.REMOTE]({subcommand: 'remove'}, CLIENT_ID)
+
+      expect(deps.gitService.removeRemote.calledOnce).to.be.true
+      expect(deps.projectConfigStore.write.called).to.be.false
+    })
+
+    it('should throw NO_REMOTE when remove is called with no remote configured', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.isInitialized.resolves(true)
+      deps.gitService.getRemoteUrl.resolves()
+      makeVcHandler(deps).setup()
+
+      try {
+        await deps.requestHandlers[VcEvents.REMOTE]({subcommand: 'remove'}, CLIENT_ID)
+        expect.fail('Expected error')
+      } catch (error) {
+        expect(error).to.be.instanceOf(VcError)
+        if (error instanceof VcError) {
+          expect(error.code).to.equal(VcErrorCode.NO_REMOTE)
+        }
+      }
+
+      expect(deps.gitService.removeRemote.called).to.be.false
+      expect(deps.projectConfigStore.write.called).to.be.false
+    })
+
+    it('should throw GIT_NOT_INITIALIZED when remove is called on uninitialized repo', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.isInitialized.resolves(false)
+      makeVcHandler(deps).setup()
+
+      try {
+        await deps.requestHandlers[VcEvents.REMOTE]({subcommand: 'remove'}, CLIENT_ID)
+        expect.fail('Expected error')
+      } catch (error) {
+        expect(error).to.be.instanceOf(VcError)
+        if (error instanceof VcError) {
+          expect(error.code).to.equal(VcErrorCode.GIT_NOT_INITIALIZED)
+        }
+      }
+    })
+
+    it('should write cleared config before calling removeRemote (idempotent retry on partial failure)', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.isInitialized.resolves(true)
+      deps.gitService.getRemoteUrl.resolves('https://byterover.dev/acme/project.git')
+      const boundConfig = new BrvConfig({
+        createdAt: '2025-01-01T00:00:00.000Z',
+        cwd: projectPath,
+        spaceId: 'sid-1',
+        spaceName: 'project',
+        teamId: 'tid-1',
+        teamName: 'acme',
+        version: '1.0.0',
+      })
+      deps.projectConfigStore.read.resolves(boundConfig)
+      makeVcHandler(deps).setup()
+
+      await deps.requestHandlers[VcEvents.REMOTE]({subcommand: 'remove'}, CLIENT_ID)
+
+      expect(deps.projectConfigStore.write.calledBefore(deps.gitService.removeRemote)).to.be.true
+    })
+
+    it('should leave config cleared when removeRemote fails after config write', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.isInitialized.resolves(true)
+      deps.gitService.getRemoteUrl.resolves('https://byterover.dev/acme/project.git')
+      const boundConfig = new BrvConfig({
+        createdAt: '2025-01-01T00:00:00.000Z',
+        cwd: projectPath,
+        spaceId: 'sid-1',
+        spaceName: 'project',
+        teamId: 'tid-1',
+        teamName: 'acme',
+        version: '1.0.0',
+      })
+      deps.projectConfigStore.read.resolves(boundConfig)
+      deps.gitService.removeRemote.rejects(new Error('simulated git failure'))
+      makeVcHandler(deps).setup()
+
+      try {
+        await deps.requestHandlers[VcEvents.REMOTE]({subcommand: 'remove'}, CLIENT_ID)
+        expect.fail('Expected error')
+      } catch (error) {
+        expect(error).to.be.instanceOf(Error)
+      }
+
+      expect(deps.projectConfigStore.write.calledOnce).to.be.true
+      const writtenConfig: BrvConfig = deps.projectConfigStore.write.firstCall.args[0]
+      expect(writtenConfig.spaceId).to.be.undefined
+      expect(writtenConfig.teamId).to.be.undefined
+    })
+
+    it('should throw INVALID_ACTION when subcommand is unknown', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.isInitialized.resolves(true)
+      makeVcHandler(deps).setup()
+
+      try {
+        await deps.requestHandlers[VcEvents.REMOTE]({subcommand: 'bogus'}, CLIENT_ID)
+        expect.fail('Expected error')
+      } catch (error) {
+        expect(error).to.be.instanceOf(VcError)
+        if (error instanceof VcError) {
+          expect(error.code).to.equal(VcErrorCode.INVALID_ACTION)
+        }
+      }
+    })
   })
 
   // ---- handleBranch ----
@@ -2507,6 +2825,26 @@ describe('VcHandler', () => {
         name: 'feature/test',
       })
       expect(result.created).to.equal('feature/test')
+    })
+
+    it('create should forward startPoint to gitService.createBranch', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.listBranches.resolves([{isCurrent: true, isRemote: false, name: 'main'}])
+      deps.gitService.log.resolves([
+        {author: {email: 'a@b.c', name: 'A'}, message: 'init', sha: 'abc', timestamp: new Date()},
+      ])
+      makeVcHandler(deps).setup()
+
+      await invoke<Extract<IVcBranchResponse, {action: 'create'}>>(deps, VcEvents.BRANCH, {
+        action: 'create',
+        name: 'feat/x',
+        startPoint: 'origin/feat/x',
+      })
+
+      expect(deps.gitService.createBranch.firstCall.args[0]).to.deep.include({
+        branch: 'feat/x',
+        startPoint: 'origin/feat/x',
+      })
     })
 
     it('create should throw BRANCH_ALREADY_EXISTS when branch exists', async () => {
@@ -2712,8 +3050,8 @@ describe('VcHandler', () => {
       deps.gitService.getCurrentBranch.resolves('main')
       deps.gitService.checkout.rejects(
         new GitError(
-          'Your local changes to the following files would be overwritten by checkout. ' +
-            'Commit your changes or stash them before you switch branches.',
+          'Your local changes would be overwritten by checkout. ' +
+            'Please commit or discard your changes before you switch branches.',
         ),
       )
       makeVcHandler(deps).setup()
@@ -2775,6 +3113,38 @@ describe('VcHandler', () => {
       expect(result).to.deep.equal({branch: 'new-branch', created: true, previousBranch: 'main'})
       expect(deps.gitService.createBranch.firstCall.args[0]).to.deep.include({branch: 'new-branch', checkout: true})
       expect(deps.gitService.checkout.called).to.be.false
+    })
+
+    it('should forward startPoint to createBranch when create flag is set', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.getCurrentBranch.resolves('main')
+      deps.gitService.listBranches.resolves([{isCurrent: true, isRemote: false, name: 'main'}])
+      makeVcHandler(deps).setup()
+
+      await invoke<IVcCheckoutResponse>(deps, VcEvents.CHECKOUT, {
+        branch: 'feat/x',
+        create: true,
+        startPoint: 'origin/feat/x',
+      })
+
+      expect(deps.gitService.createBranch.firstCall.args[0]).to.deep.include({
+        branch: 'feat/x',
+        checkout: true,
+        startPoint: 'origin/feat/x',
+      })
+    })
+
+    it('should throw INVALID_ACTION when startPoint is passed without create flag', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      makeVcHandler(deps).setup()
+
+      try {
+        await deps.requestHandlers[VcEvents.CHECKOUT]({branch: 'feat/x', startPoint: 'origin/feat/x'}, CLIENT_ID)
+        expect.fail('Expected error')
+      } catch (error) {
+        expect(error).to.be.instanceOf(VcError)
+        if (error instanceof VcError) expect(error.code).to.equal(VcErrorCode.INVALID_ACTION)
+      }
     })
 
     it('should throw BRANCH_ALREADY_EXISTS when create flag used on existing branch', async () => {
@@ -3208,6 +3578,33 @@ describe('VcHandler', () => {
           expect(error).to.be.instanceOf(VcError)
           if (error instanceof VcError) expect(error.code).to.equal(VcErrorCode.MERGE_CONFLICT)
         }
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+
+    it('should throw CONFLICT_MARKERS_PRESENT when continuing with marker text remaining', async () => {
+      const deps = makeMergeDeps(sandbox, {mergeHead: true})
+      try {
+        deps.gitService.getConflicts.resolves([])
+        deps.gitService.getFilesWithConflictMarkers.resolves(['file.md'])
+
+        makeVcHandler(deps).setup()
+        try {
+          await deps.requestHandlers[VcEvents.MERGE](
+            {action: 'continue', message: 'try commit'} satisfies IVcMergeRequest,
+            CLIENT_ID,
+          )
+          expect.fail('Expected error')
+        } catch (error) {
+          expect(error).to.be.instanceOf(VcError)
+          if (error instanceof VcError) {
+            expect(error.code).to.equal(VcErrorCode.CONFLICT_MARKERS_PRESENT)
+            expect(error.message).to.include('file.md')
+          }
+        }
+
+        expect(deps.gitService.commit.called).to.be.false
       } finally {
         cleanupDir(deps.tmpDir)
       }
@@ -3825,6 +4222,462 @@ describe('VcHandler', () => {
         const result = await invoke<IVcResetResponse>(deps, VcEvents.RESET, {})
         expect(result.mode).to.equal('mixed')
         expect(result.filesUnstaged).to.equal(2)
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+  })
+
+  describe('handleDiff', () => {
+    // eslint-disable-next-line unicorn/consistent-function-scoping
+    function makeDiffDeps(sb: SinonSandbox): TestDeps & {tmpDir: string} {
+      const tmpDir = join(tmpdir(), `brv-vc-diff-test-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`)
+      mkdirSync(tmpDir, {recursive: true})
+      const deps = makeDeps(sb, projectPath)
+      deps.contextTreeService.resolvePath.returns(tmpDir)
+      return {...deps, tmpDir}
+    }
+
+    it('should register vc:diff handler', () => {
+      const deps = makeDeps(sandbox, projectPath)
+      makeVcHandler(deps).setup()
+
+      const registeredEvents = deps.transport.onRequest.args.map((args: unknown[]) => args[0])
+      expect(registeredEvents).to.include(VcEvents.DIFF)
+    })
+
+    it('should throw GIT_NOT_INITIALIZED when git repo is missing', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.isInitialized.resolves(false)
+      makeVcHandler(deps).setup()
+
+      let caught: unknown
+      try {
+        await invoke(deps, VcEvents.DIFF, {path: 'foo.md', side: 'staged'})
+      } catch (error) {
+        caught = error
+      }
+
+      expect(caught).to.be.instanceOf(VcError)
+      expect((caught as VcError).code).to.equal(VcErrorCode.GIT_NOT_INITIALIZED)
+    })
+
+    it('staged: should compare HEAD blob (old) against index blob (new)', async () => {
+      const deps = makeDiffDeps(sandbox)
+      try {
+        deps.gitService.getBlobContent
+          .withArgs({directory: deps.tmpDir, path: 'foo.md', ref: {commitish: 'HEAD'}})
+          .resolves('old content')
+        deps.gitService.getBlobContent
+          .withArgs({directory: deps.tmpDir, path: 'foo.md', ref: 'STAGE'})
+          .resolves('new content')
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{newContent: string; oldContent: string; path: string}>(deps, VcEvents.DIFF, {
+          path: 'foo.md',
+          side: 'staged',
+        })
+
+        expect(result.path).to.equal('foo.md')
+        expect(result.oldContent).to.equal('old content')
+        expect(result.newContent).to.equal('new content')
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+
+    it('unstaged: should compare index blob (old) against working tree (new)', async () => {
+      const deps = makeDiffDeps(sandbox)
+      try {
+        writeFileSync(join(deps.tmpDir, 'foo.md'), 'working tree content')
+        deps.gitService.getBlobContent
+          .withArgs({directory: deps.tmpDir, path: 'foo.md', ref: 'STAGE'})
+          .resolves('staged content')
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{newContent: string; oldContent: string; path: string}>(deps, VcEvents.DIFF, {
+          path: 'foo.md',
+          side: 'unstaged',
+        })
+
+        expect(result.oldContent).to.equal('staged content')
+        expect(result.newContent).to.equal('working tree content')
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+
+    it('unstaged untracked: old is empty, new is file on disk', async () => {
+      const deps = makeDiffDeps(sandbox)
+      try {
+        writeFileSync(join(deps.tmpDir, 'new-file.md'), 'brand new')
+        // File not in index → getBlobContent returns undefined
+        deps.gitService.getBlobContent.resolves()
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{newContent: string; oldContent: string; path: string}>(deps, VcEvents.DIFF, {
+          path: 'new-file.md',
+          side: 'unstaged',
+        })
+
+        expect(result.oldContent).to.equal('')
+        expect(result.newContent).to.equal('brand new')
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+
+    it('unstaged deleted: old is index content, new is empty (file missing)', async () => {
+      const deps = makeDiffDeps(sandbox)
+      try {
+        // No file on disk, but index has the blob
+        deps.gitService.getBlobContent
+          .withArgs({directory: deps.tmpDir, path: 'gone.md', ref: 'STAGE'})
+          .resolves('old content')
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{newContent: string; oldContent: string; path: string}>(deps, VcEvents.DIFF, {
+          path: 'gone.md',
+          side: 'unstaged',
+        })
+
+        expect(result.oldContent).to.equal('old content')
+        expect(result.newContent).to.equal('')
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+
+    it('staged added: HEAD has no blob → old is empty', async () => {
+      const deps = makeDiffDeps(sandbox)
+      try {
+        deps.gitService.getBlobContent
+          .withArgs({directory: deps.tmpDir, path: 'new.md', ref: {commitish: 'HEAD'}})
+          .resolves()
+        deps.gitService.getBlobContent
+          .withArgs({directory: deps.tmpDir, path: 'new.md', ref: 'STAGE'})
+          .resolves('new staged content')
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{newContent: string; oldContent: string; path: string}>(deps, VcEvents.DIFF, {
+          path: 'new.md',
+          side: 'staged',
+        })
+
+        expect(result.oldContent).to.equal('')
+        expect(result.newContent).to.equal('new staged content')
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+  })
+
+  describe('handleDiscard', () => {
+    // eslint-disable-next-line unicorn/consistent-function-scoping
+    function makeDiscardDeps(
+      sb: SinonSandbox,
+    ): TestDeps & {tmpDir: string; unlinkStub: SinonStub; writeFileStub: SinonStub} {
+      const tmpDir = join(tmpdir(), `brv-vc-discard-test-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`)
+      mkdirSync(tmpDir, {recursive: true})
+      const deps = makeDeps(sb, projectPath)
+      deps.contextTreeService.resolvePath.returns(tmpDir)
+
+      // `fs.promises.writeFile` is already stubbed in the outer beforeEach.
+      const writeFileStub = fs.promises.writeFile as unknown as SinonStub
+      const unlinkStub = sb.stub(fs.promises, 'unlink').resolves()
+
+      return {...deps, tmpDir, unlinkStub, writeFileStub}
+    }
+
+    it('should register vc:discard handler', () => {
+      const deps = makeDeps(sandbox, projectPath)
+      makeVcHandler(deps).setup()
+
+      const registeredEvents = deps.transport.onRequest.args.map((args: unknown[]) => args[0])
+      expect(registeredEvents).to.include(VcEvents.DISCARD)
+    })
+
+    it('should throw GIT_NOT_INITIALIZED when git repo is missing', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.isInitialized.resolves(false)
+      makeVcHandler(deps).setup()
+
+      let caught: unknown
+      try {
+        await invoke(deps, VcEvents.DISCARD, {filePaths: ['foo.md']})
+      } catch (error) {
+        caught = error
+      }
+
+      expect(caught).to.be.instanceOf(VcError)
+      expect((caught as VcError).code).to.equal(VcErrorCode.GIT_NOT_INITIALIZED)
+    })
+
+    it('should restore tracked file from index blob', async () => {
+      const deps = makeDiscardDeps(sandbox)
+      try {
+        deps.gitService.getBlobContents
+          .withArgs({directory: deps.tmpDir, paths: ['foo.md'], ref: 'STAGE'})
+          .resolves({'foo.md': 'index content'})
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{count: number}>(deps, VcEvents.DISCARD, {filePaths: ['foo.md']})
+
+        expect(result.count).to.equal(1)
+        expect(deps.writeFileStub.calledOnce).to.be.true
+        expect(deps.writeFileStub.firstCall.args[0]).to.equal(join(deps.tmpDir, 'foo.md'))
+        expect(deps.writeFileStub.firstCall.args[1]).to.equal('index content')
+        expect(deps.unlinkStub.called).to.be.false
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+
+    it('should restore tracked file from HEAD when index has no blob', async () => {
+      const deps = makeDiscardDeps(sandbox)
+      try {
+        deps.gitService.getBlobContents
+          .withArgs({directory: deps.tmpDir, paths: ['foo.md'], ref: 'STAGE'})
+          .resolves({'foo.md': undefined})
+        deps.gitService.getBlobContents
+          .withArgs({directory: deps.tmpDir, paths: ['foo.md'], ref: {commitish: 'HEAD'}})
+          .resolves({'foo.md': 'head content'})
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{count: number}>(deps, VcEvents.DISCARD, {filePaths: ['foo.md']})
+
+        expect(result.count).to.equal(1)
+        expect(deps.writeFileStub.calledOnceWith(join(deps.tmpDir, 'foo.md'), 'head content')).to.be.true
+        expect(deps.unlinkStub.called).to.be.false
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+
+    it('should delete untracked file (no blob in index or HEAD)', async () => {
+      const deps = makeDiscardDeps(sandbox)
+      try {
+        writeFileSync(join(deps.tmpDir, 'untracked.md'), 'new content')
+        deps.gitService.getBlobContents.resolves({'untracked.md': undefined})
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{count: number}>(deps, VcEvents.DISCARD, {filePaths: ['untracked.md']})
+
+        expect(result.count).to.equal(1)
+        expect(deps.unlinkStub.calledOnce).to.be.true
+        expect(deps.unlinkStub.firstCall.args[0]).to.equal(join(deps.tmpDir, 'untracked.md'))
+        expect(deps.writeFileStub.called).to.be.false
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+
+    it('should discard multiple files in a single request', async () => {
+      const deps = makeDiscardDeps(sandbox)
+      try {
+        deps.gitService.getBlobContents
+          .withArgs({directory: deps.tmpDir, paths: ['a.md', 'b.md'], ref: 'STAGE'})
+          .resolves({'a.md': 'a index', 'b.md': 'b index'})
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{count: number}>(deps, VcEvents.DISCARD, {filePaths: ['a.md', 'b.md']})
+
+        expect(result.count).to.equal(2)
+        expect(deps.writeFileStub.callCount).to.equal(2)
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+
+    it('count reflects only successful operations (writeFile failure → not counted)', async () => {
+      const deps = makeDiscardDeps(sandbox)
+      try {
+        deps.gitService.getBlobContents
+          .withArgs({directory: deps.tmpDir, paths: ['ok.md', 'fail.md'], ref: 'STAGE'})
+          .resolves({'fail.md': 'will fail', 'ok.md': 'will succeed'})
+        deps.writeFileStub.withArgs(join(deps.tmpDir, 'fail.md'), 'will fail').rejects(new Error('disk full'))
+        deps.writeFileStub.withArgs(join(deps.tmpDir, 'ok.md'), 'will succeed').resolves()
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{count: number}>(deps, VcEvents.DISCARD, {filePaths: ['ok.md', 'fail.md']})
+
+        expect(result.count).to.equal(1)
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+
+    it('count reflects only successful operations (unlink failure → not counted)', async () => {
+      const deps = makeDiscardDeps(sandbox)
+      try {
+        deps.gitService.getBlobContents.resolves({'absent.md': undefined, 'present.md': undefined})
+        deps.unlinkStub.withArgs(join(deps.tmpDir, 'absent.md')).rejects(new Error('ENOENT'))
+        deps.unlinkStub.withArgs(join(deps.tmpDir, 'present.md')).resolves()
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{count: number}>(deps, VcEvents.DISCARD, {filePaths: ['present.md', 'absent.md']})
+
+        expect(result.count).to.equal(1)
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+
+    it('should return count=0 and do nothing for empty filePaths', async () => {
+      const deps = makeDiscardDeps(sandbox)
+      try {
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{count: number}>(deps, VcEvents.DISCARD, {filePaths: []})
+
+        expect(result.count).to.equal(0)
+        expect(deps.writeFileStub.called).to.be.false
+        expect(deps.unlinkStub.called).to.be.false
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+  })
+
+  describe('handleDiffs', () => {
+    // eslint-disable-next-line unicorn/consistent-function-scoping
+    function makeDiffsDeps(sb: SinonSandbox): TestDeps & {tmpDir: string} {
+      const tmpDir = join(tmpdir(), `brv-vc-diffs-test-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`)
+      mkdirSync(tmpDir, {recursive: true})
+      const deps = makeDeps(sb, projectPath)
+      deps.contextTreeService.resolvePath.returns(tmpDir)
+      return {...deps, tmpDir}
+    }
+
+    it('should register vc:diffs handler', () => {
+      const deps = makeDeps(sandbox, projectPath)
+      makeVcHandler(deps).setup()
+
+      const registeredEvents = deps.transport.onRequest.args.map((args: unknown[]) => args[0])
+      expect(registeredEvents).to.include(VcEvents.DIFFS)
+    })
+
+    it('should throw GIT_NOT_INITIALIZED when git repo is missing', async () => {
+      const deps = makeDeps(sandbox, projectPath)
+      deps.gitService.isInitialized.resolves(false)
+      makeVcHandler(deps).setup()
+
+      let caught: unknown
+      try {
+        await invoke(deps, VcEvents.DIFFS, {paths: ['foo.md'], side: 'staged'})
+      } catch (error) {
+        caught = error
+      }
+
+      expect(caught).to.be.instanceOf(VcError)
+      expect((caught as VcError).code).to.equal(VcErrorCode.GIT_NOT_INITIALIZED)
+    })
+
+    it('should return empty array when paths is empty', async () => {
+      const deps = makeDiffsDeps(sandbox)
+      try {
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{diffs: Array<{newContent: string; oldContent: string; path: string}>}>(
+          deps,
+          VcEvents.DIFFS,
+          {paths: [], side: 'staged'},
+        )
+
+        expect(result.diffs).to.deep.equal([])
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+
+    it('staged: returns HEAD vs STAGE for every path, preserving order', async () => {
+      const deps = makeDiffsDeps(sandbox)
+      try {
+        deps.gitService.getBlobContents
+          .withArgs({directory: deps.tmpDir, paths: ['a.md', 'b.md'], ref: {commitish: 'HEAD'}})
+          .resolves({'a.md': 'a head', 'b.md': 'b head'})
+        deps.gitService.getBlobContents
+          .withArgs({directory: deps.tmpDir, paths: ['a.md', 'b.md'], ref: 'STAGE'})
+          .resolves({'a.md': 'a stage', 'b.md': 'b stage'})
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{diffs: Array<{newContent: string; oldContent: string; path: string}>}>(
+          deps,
+          VcEvents.DIFFS,
+          {paths: ['a.md', 'b.md'], side: 'staged'},
+        )
+
+        expect(result.diffs).to.have.length(2)
+        expect(result.diffs[0]).to.deep.equal({
+          newContent: 'a stage',
+          oldContent: 'a head',
+          path: 'a.md',
+          status: 'modified',
+        })
+        expect(result.diffs[1]).to.deep.equal({
+          newContent: 'b stage',
+          oldContent: 'b head',
+          path: 'b.md',
+          status: 'modified',
+        })
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+
+    it('staged: reports `modified` (not `added`) when HEAD blob is empty but STAGE has content', async () => {
+      const deps = makeDiffsDeps(sandbox)
+      try {
+        deps.gitService.getBlobContents
+          .withArgs({directory: deps.tmpDir, paths: ['empty.md'], ref: {commitish: 'HEAD'}})
+          .resolves({'empty.md': ''})
+        deps.gitService.getBlobContents
+          .withArgs({directory: deps.tmpDir, paths: ['empty.md'], ref: 'STAGE'})
+          .resolves({'empty.md': 'now has content\n'})
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{
+          diffs: Array<{newContent: string; oldContent: string; path: string; status: string}>
+        }>(deps, VcEvents.DIFFS, {paths: ['empty.md'], side: 'staged'})
+
+        expect(result.diffs).to.have.length(1)
+        expect(result.diffs[0].status).to.equal('modified')
+        expect(result.diffs[0].oldContent).to.equal('')
+        expect(result.diffs[0].newContent).to.equal('now has content\n')
+      } finally {
+        cleanupDir(deps.tmpDir)
+      }
+    })
+
+    it('unstaged: returns STAGE vs working tree for every path', async () => {
+      const deps = makeDiffsDeps(sandbox)
+      try {
+        writeFileSync(join(deps.tmpDir, 'foo.md'), 'foo working')
+        writeFileSync(join(deps.tmpDir, 'bar.md'), 'bar working')
+        deps.gitService.getBlobContents
+          .withArgs({directory: deps.tmpDir, paths: ['foo.md', 'bar.md'], ref: 'STAGE'})
+          .resolves({'bar.md': 'bar stage', 'foo.md': 'foo stage'})
+        makeVcHandler(deps).setup()
+
+        const result = await invoke<{diffs: Array<{newContent: string; oldContent: string; path: string}>}>(
+          deps,
+          VcEvents.DIFFS,
+          {paths: ['foo.md', 'bar.md'], side: 'unstaged'},
+        )
+
+        expect(result.diffs).to.have.length(2)
+        expect(result.diffs[0]).to.deep.equal({
+          newContent: 'foo working',
+          oldContent: 'foo stage',
+          path: 'foo.md',
+          status: 'modified',
+        })
+        expect(result.diffs[1]).to.deep.equal({
+          newContent: 'bar working',
+          oldContent: 'bar stage',
+          path: 'bar.md',
+          status: 'modified',
+        })
       } finally {
         cleanupDir(deps.tmpDir)
       }

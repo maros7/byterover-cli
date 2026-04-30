@@ -18,6 +18,7 @@ import type {CipherAgentServices, SessionServices} from '../../core/interfaces/c
 import type {IContentGenerator} from '../../core/interfaces/i-content-generator.js'
 import type {ValidatedAgentConfig} from './agent-schemas.js'
 
+import { RuntimeSignalStore } from '../../../server/infra/context-tree/runtime-signal-store.js'
 import { createBlobStorage } from '../blob/blob-storage-factory.js'
 import { EnvironmentContextBuilder } from '../environment/environment-context-builder.js'
 import { AgentEventBus, SessionEventBus } from '../events/event-emitter.js'
@@ -42,11 +43,17 @@ import { SandboxService } from '../sandbox/sandbox-service.js'
 import { FileKeyStorage } from '../storage/file-key-storage.js'
 import { GranularHistoryStorage } from '../storage/granular-history-storage.js'
 import { MessageStorageService } from '../storage/message-storage-service.js'
+import { loadSwarmConfig } from '../swarm/config/swarm-config-loader.js'
+import { buildProvidersFromConfig } from '../swarm/provider-factory.js'
+import { SwarmCoordinator } from '../swarm/swarm-coordinator.js'
+import { validateSwarmProviders } from '../swarm/validation/config-validator.js'
 import { ContextTreeStructureContributor } from '../system-prompt/contributors/context-tree-structure-contributor.js'
 import { MapSelectionContributor } from '../system-prompt/contributors/map-selection-contributor.js'
+import { SwarmStateContributor } from '../system-prompt/contributors/swarm-state-contributor.js'
 import { SystemPromptManager } from '../system-prompt/system-prompt-manager.js'
 import { CoreToolScheduler } from '../tools/core-tool-scheduler.js'
 import { DEFAULT_POLICY_RULES } from '../tools/default-policy-rules.js'
+import { createSearchKnowledgeService } from '../tools/implementations/search-knowledge-service.js'
 import { PolicyEngine } from '../tools/policy-engine.js'
 import { ToolDescriptionLoader } from '../tools/tool-description-loader.js'
 import { ToolManager } from '../tools/tool-manager.js'
@@ -208,10 +215,78 @@ export async function createCipherAgentServices(
   const mapSelectionContributor = new MapSelectionContributor('mapSelection', 16)
   systemPromptManager.registerContributor(mapSelectionContributor)
 
+  // 6b. Storage layer — initialised before the swarm block so the swarm
+  // SearchKnowledgeService receives `runtimeSignalStore` at construction
+  // time. Post-commit-5 the markdown fallback is gone, so a swarm search
+  // without the sidecar would silently drop every access-hit bump.
+  const keyStorage = new FileKeyStorage({
+    storageDir: storageBasePath,
+  })
+  await keyStorage.initialize()
+
+  const messageStorage = new MessageStorageService(keyStorage)
+  const messageStorageService = messageStorage
+  const historyStorage = new GranularHistoryStorage(messageStorage)
+
+  // Sidecar store for per-machine ranking signals (importance, recency,
+  // maturity, accessCount, updateCount). Kept out of the context-tree
+  // markdown so query-time bumps don't dirty version-controlled files.
+  const runtimeSignalStore = new RuntimeSignalStore(keyStorage, logger)
+
+  // 6c. Swarm coordinator — try to load config and build providers.
+  // Missing config → fail-open (no swarm). Invalid config → warn but continue.
+  let swarmCoordinator: SwarmCoordinator | undefined
+  try {
+    const swarmConfig = await loadSwarmConfig(workingDirectory)
+
+    // Validate enrichment topology — structural errors block swarm init.
+    // Provider-specific errors (bad paths, missing API keys) are handled
+    // by health checks, preserving degraded-mode semantics.
+    const swarmValidation = await validateSwarmProviders(swarmConfig)
+    const topologyErrors = swarmValidation.errors.filter((e) => e.provider === 'enrichment')
+    if (topologyErrors.length > 0) {
+      const messages = topologyErrors.map((e) => e.message)
+      throw new Error(`Invalid enrichment topology:\n  ${messages.join('\n  ')}`)
+    }
+
+    // Log provider-specific warnings/errors without blocking
+    for (const error of swarmValidation.errors.filter((e) => e.provider !== 'enrichment')) {
+      logger.warn(`Swarm provider issue: ${error.provider}: ${error.message}`)
+    }
+
+    const swarmProviders = buildProvidersFromConfig(swarmConfig, {
+      searchService: createSearchKnowledgeService(fileSystemService, {
+        baseDirectory: workingDirectory,
+        logger,
+        runtimeSignalStore,
+      }),
+    })
+
+    if (swarmProviders.length > 0) {
+      swarmCoordinator = new SwarmCoordinator(swarmProviders, swarmConfig)
+      // Run initial health checks so unhealthy providers are skipped from first query
+      await swarmCoordinator.refreshHealth()
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    const isConfigMissing = message.includes('not found')
+    if (!isConfigMissing) {
+      // Config exists but is invalid — warn so the user can diagnose
+      logger.warn(`Swarm disabled due to config error: ${message}`)
+    }
+    // Missing config is expected — silently skip
+  }
+
+  // Register swarm state contributor when multi-provider swarm is active
+  if (swarmCoordinator) {
+    const swarmStateContributor = new SwarmStateContributor('swarmState', 17, swarmCoordinator)
+    systemPromptManager.registerContributor(swarmStateContributor)
+  }
+
   // 7. Abstract generation queue (generator injected later via rebindCurateTools)
   const abstractQueue = new AbstractGenerationQueue(workingDirectory)
 
-  // 8. Tool provider (depends on FileSystemService, ProcessService, MemoryManager, SystemPromptManager)
+  // 9. Tool provider (depends on FileSystemService, ProcessService, MemoryManager, SystemPromptManager)
   const verbose = config.llm.verbose ?? false
   const descriptionLoader = new ToolDescriptionLoader()
   const toolProvider: ToolProvider = new ToolProvider(
@@ -222,35 +297,27 @@ export async function createCipherAgentServices(
       getToolProvider: (): ToolProvider => toolProvider,
       memoryManager,
       processService,
+      runtimeSignalStore,
       sandboxService,
+      swarmCoordinator,
     },
     systemPromptManager,
     descriptionLoader,
   )
   await toolProvider.initialize()
 
-  // 9. Policy engine with default rules for autonomous execution
+  // 10. Policy engine with default rules for autonomous execution
   const policyEngine = new PolicyEngine({defaultDecision: 'ALLOW'})
   policyEngine.addRules(DEFAULT_POLICY_RULES)
 
-  // 10. Tool scheduler (orchestrates policy check → execution)
+  // 11. Tool scheduler (orchestrates policy check → execution)
   const toolScheduler = new CoreToolScheduler(toolProvider, policyEngine, undefined, {
     verbose,
   })
 
-  // 11. Tool manager (with scheduler for policy-based execution)
+  // 12. Tool manager (with scheduler for policy-based execution)
   const toolManager = new ToolManager(toolProvider, toolScheduler)
   await toolManager.initialize()
-
-  // 11. History storage - granular file-based storage
-  const keyStorage = new FileKeyStorage({
-    storageDir: storageBasePath,
-  })
-  await keyStorage.initialize()
-
-  const messageStorage = new MessageStorageService(keyStorage)
-  const messageStorageService = messageStorage
-  const historyStorage = new GranularHistoryStorage(messageStorage)
 
   // CompactionService for context overflow management
   const tokenizer = new GeminiTokenizer(config.model ?? 'gemini-3-flash-preview')
@@ -279,6 +346,7 @@ export async function createCipherAgentServices(
     messageStorageService,
     policyEngine,
     processService,
+    runtimeSignalStore,
     sandboxService,
     systemPromptManager,
     toolManager,

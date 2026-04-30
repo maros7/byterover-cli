@@ -2,6 +2,129 @@
 
 All notable user-facing changes to ByteRover CLI will be documented in this file.
 
+## [3.10.1]
+
+### Added
+- **`brv review --disable` / `--enable` per project.** Opt a project out of the human-in-the-loop review prompts and backups, or turn them back on. Run `brv review` with no flags to see the current state. Existing `brv review pending / approve / reject` are unchanged.
+
+### Changed
+- **`brv curate` returns to your prompt right away.** The final summary-rebuild step now runs in the background instead of making you wait. Nothing is skipped, just moved off your wait time (about 18 seconds saved on a typical run).
+
+### Fixed
+- **Clearer `brv vc status` and `brv vc pull` errors.** Status now catches a few staged-then-edited file states it used to hide. When a pull, checkout, or merge would overwrite local changes, the error now lists the affected files instead of just saying "local changes would be overwritten."
+- **OpenAI-compatible providers fail loudly when the URL is wrong.** First-time setup for Ollama, LM Studio, and similar providers now checks the base URL up front and shows the error inline. Bad URLs no longer pre-select a placeholder `llama3` model or hang the REPL on disconnect / reconnect.
+
+## [3.10.0]
+
+### Added
+- **Connect OpenClaude as an agent.** Run `brv connectors install "OpenClaude"` or pick it in `/connectors`.
+
+### Changed
+- **Prettier `brv login` confirmation page.** The browser tab after sign-in now matches the brv dark theme, with a styled error page if sign-in fails.
+- **Faster, more reliable first-run startup.** The first `brv` command after install or restart connects more consistently, and no longer hangs when the sign-in provider is slow.
+
+### Fixed
+- **`brv restart` works inside nested shell wrappers.** Used to leave the daemon stuck when `brv` was launched through several wrapper scripts (a shell alias, an npm script, or a CI runner). Fixed on macOS, Linux, and Windows.
+- **`brv curate` counts as one operation, not many.** Curating many folders at once was being billed once per folder, which could push fresh free-tier accounts past their limit in a single run. Grouped correctly now.
+- **Security update.** Patched `postcss` and several other dependencies to address a high-severity advisory.
+
+## [3.9.0]
+
+### Added
+- **`brv vc diff` shows what changed in your context tree.** See staged and unstaged changes against HEAD, or compare branches and commits. Also available as `/vc-diff` in the REPL and with `--format json`.
+- **`brv vc remote remove` deletes a git remote.** Available from the CLI and from a new Delete button (with confirmation) in the web UI Remotes panel.
+- **Configuration page in `brv webui`.** Manage your context-tree git identity (user.name, user.email) and the `origin` remote from the browser. One click seeds your identity from your signed-in ByteRover account; a status dot is amber when identity is unset and green once it is. Provider and remote error toasts deep-link back to the relevant section.
+
+### Changed
+- **First-run tour teaches by clicking through.** Instead of auto-opening the composer, the tour highlights the Tasks tab and "New task" button with a glowing arrow and dims the rest of the page. Failed tasks during the tour now offer a "Try again" action that prefills the composer.
+- **ByteRover pinned at the top of the provider picker.** In `brv webui`, ByteRover sits first with a "Native" badge and opens the sign-in popup directly, with no extra confirmation step.
+
+### Fixed
+- **Google default model updated to `gemini-3-flash-preview`** (was `gemini-3.1-flash-lite-preview`).
+- **`brv dream` no longer pollutes `brv vc` diffs.** Synthesis used to reorder context-file frontmatter fields (`title`, `summary`, `tags`, `keywords`, `related`, `createdAt`, `updatedAt`); field order is now preserved.
+
+## [3.8.3]
+
+### Changed
+- **`brv login` opens your browser by default** — Just run `brv login` and sign in in your browser. On CI or a remote shell, use `--api-key <key>` instead (get one at https://app.byterover.dev/settings/keys). SSH and non-interactive shells are detected automatically and skip the browser step.
+- **Provider picker shows what each provider is** — `brv providers list` and the web provider picker now show a short description under each name, so you can pick by what a provider does instead of guessing from the brand.
+
+### Fixed
+- **No more "Logged in as undefined"** — `brv login` now says "Logged in successfully" when the server doesn't return your email.
+- **`brv webui` works when installed under a hidden folder** — Reloading a page like `/contexts` no longer 404s when `brv` lives under a dotfile path such as `~/.nvm/...` or `~/.asdf/...`.
+
+## [3.8.2]
+
+### Fixed
+- **Web UI styles missing in the published-package build** — `brv webui` from the installed CLI used to render shared components (dialogs, sheets) unstyled because the Tailwind `@source` glob didn't match the installed layout of `@campfirein/byterover-packages`.
+
+## [3.8.0]
+
+### Added
+- **`brv webui` — a browser dashboard for ByteRover** — Run `brv webui` to open a local dashboard at `http://localhost:7700`. Browse and edit your context tree, review and commit changes, run curate and query, manage LLM providers and connected agents, and switch between projects — all from the browser. Still loads when the daemon isn't running, with a clear recovery screen. Use `--port <n>` to pick a different port (remembered across runs).
+- **Guided first-run tour** — The web UI walks new users through setting up a provider, running their first curate and query, and connecting an agent. "Restart the tour" lives in the Help menu if you skip it.
+
+### Changed
+- **Connected agents now wait for `brv curate` by default** — The agent skill installed by `brv connectors install` tells Claude Code, Cursor, Codex, Copilot, and other connected agents to let `brv curate` finish before moving on, so follow-up queries see the new data. Agents only fire-and-forget (`--detach`) when you explicitly say so. Re-run `brv connectors install <agent>` to update.
+- **Updated default models** — OpenAI via OAuth now defaults to `gpt-5.4-mini`; MiniMax now defaults to `MiniMax-M2.7`.
+- **Complete frontmatter on context files** — Context-tree markdown files written by `brv curate` and `brv dream` now always include all seven semantic fields (title, summary, tags, related, keywords, createdAt, updatedAt). Older files without them still load fine.
+
+### Fixed
+- **ByteRover OAuth login now resumes provider setup** — Picking ByteRover while signed out used to bounce you back to the provider list after login; it now continues the setup automatically.
+- **No more "Connecting to ByteRover…" hang after a fresh login** — Provider connect sees new credentials immediately instead of waiting up to 5 seconds for a cache refresh.
+- **Security dependency update** — Patched `@hono/node-server` and `hono` to address a high-severity npm advisory.
+
+## [3.7.1]
+
+### Changed
+- **Agent skill template — dedicated "Query and Curate History" section** — The bundled `SKILL.md` installed via `brv connectors install` (for Claude Code, Cursor, Codex, Copilot, and other skill-based agents) now has a dedicated Section 11 covering `brv curate view`, `brv query-log view`, and `brv query-log summary` — including the resolution-tier taxonomy (0=exact cache … 4=full agentic) and time/status filters. Connected agents will now reach for history and recall metrics when debugging knowledge gaps instead of guessing. Re-run `brv connectors install <agent>` to regenerate the skill for an existing connector.
+
+### Fixed
+- **`brv vc status` stays clean after queries and curates** — Runtime ranking signals (hotness, recency, access counts, maturity) used to live in markdown frontmatter, so every `brv search`, `brv query`, or agent curate silently dirtied context files and polluted `brv vc status` / `brv vc diff`. Those signals now live in a per-project sidecar outside the context tree; markdown keeps only semantic fields (title, tags, keywords, summary, related, createdAt, updatedAt). Older context trees with legacy signal fields in frontmatter continue to parse — stale fields are ignored on read, so no migration is needed.
+- **Synthesis files no longer leak `maturity: draft` into frontmatter** — `brv dream synthesize` previously wrote `maturity: draft` into the YAML frontmatter of each new synthesis file; that field now seeds the sidecar instead, leaving the synthesis markdown body and frontmatter free of ranking state.
+- **`brv vc` diffs no longer show OS / editor noise** — Added the following patterns to the context-tree `.gitignore` so they're excluded from `brv vc` tracking: `.DS_Store`, `._*` (macOS); `Thumbs.db`, `ehthumbs.db`, `Desktop.ini` (Windows); `.directory`, `.fuse_hidden*`, `.nfs*` (Linux); and editor swap/backup/temp patterns `*.swp`, `*.swo`, `*~`, `.#*`, `*.bak`, `*.tmp`. Patterns auto-sync into existing projects on the next `brv vc` command — no manual `.gitignore` edit required.
+
+## [3.7.0]
+
+### Added
+- **Intel Mac (darwin-x64) install support** — `curl -fsSL https://byterover.dev/install.sh | sh` now installs on Intel Macs. Previously the installer rejected `darwin-x64` with an Apple-Silicon-only error. CI also publishes a `darwin-x64` tarball alongside the existing `darwin-arm64`, `linux-x64`, and `linux-arm64` builds.
+
+### Fixed
+- **Security dependency update** — Updated `basic-ftp` and `hono` to patch a high-severity npm advisory.
+
+## [3.6.0]
+
+### Added
+- **`brv dream` — tidy up your context tree** — A new command that cleans up your memory in the background: merges related notes, writes short summaries that connect ideas across topics, and archives stale entries. It runs on its own when the CLI has been idle for a while, or you can run it yourself. Changes the model is unsure about are held for you to review with `brv review pending`, and `brv dream --undo` reverts the last run. Flags: `--force` / `-f` to skip the time and activity gates, `--detach` to queue and exit without waiting, `--undo`, `--timeout <seconds>`, `--format json`.
+- **`brv query-log` — see what you've asked before** — Every `brv query` is now saved locally so you can look back at past questions and how they were answered. `brv query-log view` lists recent queries with filters `--status`, `--tier`, `--since`, `--before`, and `--limit`, plus `--detail` to also show the matched docs for each entry, and `--format json`. `brv query-log summary` shows aggregated metrics — coverage, cache hit rate, and top topics — over a window set by `--last`, `--since`, or `--before`, with `--format` options `text`, `json`, or `narrative` for a plain-English recap.
+
+## [3.5.1]
+
+### Changed
+- **Clearer MCP tool descriptions** — The `cwd` parameter on `brv-curate` and `brv-query` MCP tools now tells the calling LLM exactly when the project path is required (Claude Desktop, hosted MCP) vs. optional (Cursor, Cline, Zed, Claude Code). This reduces failed tool calls from clients that omitted the path or guessed a relative one.
+
+## [3.5.0]
+
+### Added
+- **Claude Desktop support** — Connect ByteRover to the Claude Desktop app with `brv connectors install "Claude Desktop"` (or pick it in `/connectors`). Works on macOS, Windows (including Store installs), and Linux. After installing, fully quit Claude Desktop from the tray or menu bar and reopen it to apply.
+
+### Changed
+- **Cleaner install layout** — The `install.sh` installer now keeps its bundled Node.js tucked away so it won't conflict with the `node` already on your system. Just reinstall to pick up the new layout.
+
+### Fixed
+- **Security dependency update** — Updated `basic-ftp` to patch a high-severity vulnerability.
+
+## [3.4.0]
+
+### Added
+- **`brv swarm` — unified memory swarm** — Connect multiple memory providers (ByteRover context tree, Obsidian vaults, local markdown folders, GBrain, OpenClaw Memory Wiki) into a single query and storage layer. `brv swarm onboard` walks through an interactive setup wizard; `brv swarm status` shows provider health, write targets, and enrichment topology. `brv swarm query <question>` runs intelligent routing, parallel provider execution, and Reciprocal Rank Fusion merging — add `--explain` for classification reasoning and provider selection details. `brv swarm curate <content>` stores to the best writable provider based on content classification (`--provider` to override), falling back to ByteRover context-tree curation when no external target is available. Control how providers feed context to each other via `enrichment.edges` in `swarm.config.yaml` — the engine validates cycles, self-edges, and missing providers, and disabled-provider edges produce warnings instead of errors so partial setups degrade gracefully. The agent also gains `swarm_query` and `swarm_store` tools, and sandboxed code can call `tools.swarmQuery()` / `tools.swarmStore()`.
+- **GPT-5.4 Mini support** — Added `gpt-5.4-mini` to the Codex allowed models list.
+
+### Fixed
+- **Context-tree `.gitignore` auto-sync** — The context-tree `.gitignore` now stays up to date automatically. When any `brv vc` command runs, missing patterns are appended to the existing file instead of only being written on first init. This prevents derived artifacts from polluting `brv vc` diffs after CLI updates.
+- **Stale knowledge locations** — Knowledge entries whose source files were deleted are now cleaned up, preventing dead references in search and query results.
+- **Security dependency update** — Pinned axios to 1.15.0 to address a critical vulnerability.
+
 ## [3.3.0]
 
 ### Added

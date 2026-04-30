@@ -1,4 +1,5 @@
 export const BRV_DIR = '.brv'
+export const API_V1_PATH = '/api/v1'
 export const PROJECT_CONFIG_FILE = 'config.json'
 export const BRV_CONFIG_VERSION = '0.0.1'
 
@@ -58,6 +59,9 @@ export const DYNAMIC_PORT_MIN = 49_152
 export const DYNAMIC_PORT_MAX = 65_535
 export const PORT_BATCH_SIZE = 20
 export const PORT_MAX_ATTEMPTS = 5
+// Web UI (stable port, separate from dynamic transport port)
+export const WEBUI_DEFAULT_PORT = 7700
+export const WEBUI_STATE_FILE = 'webui.json'
 // Heartbeat
 export const HEARTBEAT_FILE = 'heartbeat'
 export const HEARTBEAT_INTERVAL_MS = 5000 // Write every 5s
@@ -99,6 +103,13 @@ export const AGENT_PROCESS_STOP_TIMEOUT_MS = 5000 // 5s max wait for child proce
 export const CURATE_LOG_DIR = 'curate-log'
 export const CURATE_LOG_ID_PREFIX = 'cur'
 
+// Query log
+export const QUERY_LOG_DIR = 'query-log'
+export const QUERY_LOG_ID_PREFIX = 'qry'
+// Dream log
+export const DREAM_LOG_DIR = 'dream-log'
+export const DREAM_LOG_ID_PREFIX = 'drm'
+
 // Review backups (stores pre-curate file content for local HITL review diffs)
 export const REVIEW_BACKUPS_DIR = 'review-backups'
 // === Hierarchical DAG (summary, archive, manifest) ===
@@ -112,12 +123,37 @@ export const MANIFEST_FILE = '_manifest.json'
 export const ARCHIVE_IMPORTANCE_THRESHOLD = 35
 export const DEFAULT_GHOST_CUE_MAX_TOKENS = 220
 
-/** .gitignore content for the context tree — ignore derived artifacts only */
-export const CONTEXT_TREE_GITIGNORE = `# Derived artifacts — do not track
-.gitignore
-.snapshot.json
-_manifest.json
-_index.md
-*.abstract.md
-*.overview.md
-`
+/** Patterns the context-tree .gitignore must contain. */
+export const CONTEXT_TREE_GITIGNORE_PATTERNS = [
+  // Derived artifacts
+  '.gitignore',
+  '.snapshot.json',
+  '_manifest.json',
+  '_index.md',
+  '*.abstract.md',
+  '*.overview.md',
+
+  // macOS
+  '.DS_Store',
+  '._*',
+
+  // Windows
+  'Thumbs.db',
+  'ehthumbs.db',
+  'Desktop.ini',
+
+  // Linux
+  '.directory',
+  '.fuse_hidden*',
+  '.nfs*',
+
+  // Editor swap / backup / temp
+  '*.swp',
+  '*.swo',
+  '*~',
+  '.#*',
+  '*.bak',
+  '*.tmp',
+]
+
+export const CONTEXT_TREE_GITIGNORE_HEADER = '# Derived artifacts — do not track'

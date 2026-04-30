@@ -49,6 +49,7 @@ import {TransportDaemonEventNames} from '../../../core/domain/transport/schemas.
 import {getErrorMessage} from '../../../utils/error-helpers.js'
 import {processLog} from '../../../utils/process-logger.js'
 import {validateApiKey as validateApiKeyViaFetcher} from '../../http/provider-model-fetcher-registry.js'
+import {OpenAICompatibleModelFetcher} from '../../http/provider-model-fetchers.js'
 import {
   exchangeForCopilotToken as defaultExchangeForCopilotToken,
   pollForAccessToken as defaultPollForAccessToken,
@@ -62,6 +63,14 @@ import {
   ProviderCallbackServer,
   ProviderCallbackTimeoutError,
 } from '../../provider-oauth/index.js'
+
+async function defaultValidateOpenAICompatibleEndpoint(params: {
+  apiKey: string
+  baseUrl: string
+}): Promise<{error?: string; isValid: boolean}> {
+  const fetcher = new OpenAICompatibleModelFetcher(params.baseUrl, 'OpenAI Compatible')
+  return fetcher.validateApiKey(params.apiKey)
+}
 
 type OAuthFlowState = {
   awaitInProgress?: boolean
@@ -93,6 +102,11 @@ export interface ProviderHandlerDeps {
   /** Device code request function (injectable for testing) */
   requestDeviceCode?: (params: RequestDeviceCodeParams) => Promise<DeviceCodeResponse>
   transport: ITransportServer
+  /** Validator for openai-compatible base URL (injectable for testing) */
+  validateOpenAICompatibleEndpoint?: (params: {
+    apiKey: string
+    baseUrl: string
+  }) => Promise<{error?: string; isValid: boolean}>
 }
 
 /**
@@ -113,6 +127,10 @@ export class ProviderHandler {
   private readonly providerOAuthTokenStore: IProviderOAuthTokenStore
   private readonly requestDeviceCode: (params: RequestDeviceCodeParams) => Promise<DeviceCodeResponse>
   private readonly transport: ITransportServer
+  private readonly validateOpenAICompatibleEndpoint: (params: {
+    apiKey: string
+    baseUrl: string
+  }) => Promise<{error?: string; isValid: boolean}>
 
   constructor(deps: ProviderHandlerDeps) {
     this.authStateStore = deps.authStateStore
@@ -127,6 +145,8 @@ export class ProviderHandler {
     this.providerOAuthTokenStore = deps.providerOAuthTokenStore
     this.requestDeviceCode = deps.requestDeviceCode ?? defaultRequestDeviceCode
     this.transport = deps.transport
+    this.validateOpenAICompatibleEndpoint =
+      deps.validateOpenAICompatibleEndpoint ?? defaultValidateOpenAICompatibleEndpoint
   }
 
   setup(): void {
@@ -310,16 +330,53 @@ export class ProviderHandler {
         return {error: 'ByteRover Provider requires authentication. Run /login or brv login to sign in', success: false}
       }
 
+      // Verify openai-compatible endpoint is reachable before persisting anything —
+      // a failed setup must not leave a placeholder config that masquerades as
+      // connected. Falls back to existing baseUrl/keychain key on reconfigure
+      // when the request omits them, so a partial reconfigure (e.g. only changing
+      // the URL) still validates with the user's stored credentials.
+      if (providerId === 'openai-compatible') {
+        const existingBaseUrl = await this.providerConfigStore.read().then((c) => c.getBaseUrl(providerId))
+        const effectiveBaseUrl = baseUrl ?? existingBaseUrl
+        if (!effectiveBaseUrl) {
+          return {
+            error: 'A base URL is required for OpenAI-compatible providers (e.g. http://localhost:11434/v1)',
+            success: false,
+          }
+        }
+
+        const effectiveApiKey = apiKey ?? (await this.providerKeychainStore.getApiKey(providerId)) ?? ''
+        const validation = await this.validateOpenAICompatibleEndpoint({
+          apiKey: effectiveApiKey,
+          baseUrl: effectiveBaseUrl,
+        })
+        if (!validation.isValid) {
+          const detail = validation.error ? `: ${validation.error}` : ''
+          return {
+            error: `Could not reach OpenAI-compatible endpoint at ${effectiveBaseUrl}${detail}`,
+            success: false,
+          }
+        }
+      }
+
       // Store API key if provided (supports optional keys for openai-compatible)
       if (apiKey) {
         await this.providerKeychainStore.setApiKey(providerId, apiKey)
       }
 
       const provider = getProviderById(providerId)
+      // Skip activating the provider when it ends up with no active model —
+      // the welcome view treats `activeProvider w/o activeModel` as
+      // "needs setup" and unmounts any in-flight setup flow on the home
+      // page. The model:setActive handler activates the provider when the
+      // user picks a model, which is the right moment.
+      const willHaveActiveModel = Boolean(provider?.defaultModel)
+        || Boolean(await this.providerConfigStore.getActiveModel(providerId))
       await this.providerConfigStore.connectProvider(providerId, {
         activeModel: provider?.defaultModel,
         authMethod: apiKey ? 'api-key' : undefined,
         baseUrl,
+        setAsActive: willHaveActiveModel,
       })
 
       this.transport.broadcast(TransportDaemonEventNames.PROVIDER_UPDATED, {})
@@ -370,6 +427,7 @@ export class ProviderHandler {
           const authMethod = providerConfig?.authMethod
 
           return {
+            activeModel: providerConfig?.activeModel,
             apiKeyUrl: def.apiKeyUrl,
             authMethod,
             category: def.category,

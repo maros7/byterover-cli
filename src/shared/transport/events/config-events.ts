@@ -7,7 +7,8 @@ export const ConfigEvents = {
 } as const
 
 export interface ConfigGetEnvironmentResponse {
-  apiBaseUrl: string
+  gitRemoteBaseUrl: string
+  iamBaseUrl: string
   isDevelopment: boolean
   webAppUrl: string
 }

@@ -5,6 +5,7 @@
  * These handlers implement the TUI ↔ Server event contract.
  */
 
+import {access} from 'node:fs/promises'
 import {join} from 'node:path'
 
 import type {IConnectorManager} from '../../core/interfaces/connectors/i-connector-manager.js'
@@ -19,7 +20,7 @@ import type {ProjectBroadcaster, ProjectPathResolver} from '../transport/handler
 import {ReviewEvents} from '../../../shared/transport/events/review-events.js'
 import {getAuthConfig} from '../../config/auth.config.js'
 import {getCurrentConfig} from '../../config/environment.js'
-import {BRV_DIR} from '../../constants.js'
+import {API_V1_PATH, BRV_DIR} from '../../constants.js'
 import {getProjectDataDir} from '../../utils/path-utils.js'
 import {OAuthService} from '../auth/oauth-service.js'
 import {OidcDiscoveryService} from '../auth/oidc-discovery-service.js'
@@ -51,6 +52,7 @@ import {
   AuthHandler,
   ConfigHandler,
   ConnectorsHandler,
+  ContextTreeHandler,
   HubHandler,
   InitHandler,
   LocationsHandler,
@@ -80,6 +82,7 @@ export interface FeatureHandlersOptions {
   providerOAuthTokenStore: IProviderOAuthTokenStore
   resolveProjectPath: ProjectPathResolver
   transport: ITransportServer
+  webuiPort?: number
 }
 
 /**
@@ -97,13 +100,18 @@ export async function setupFeatureHandlers({
   providerOAuthTokenStore,
   resolveProjectPath,
   transport,
+  webuiPort,
 }: FeatureHandlersOptions): Promise<void> {
   const envConfig = getCurrentConfig()
   const tokenStore = createTokenStore()
   const projectConfigStore = new ProjectConfigStore()
-  const userService = new HttpUserService({apiBaseUrl: envConfig.apiBaseUrl})
-  const teamService = new HttpTeamService({apiBaseUrl: envConfig.apiBaseUrl})
-  const spaceService = new HttpSpaceService({apiBaseUrl: envConfig.apiBaseUrl})
+
+  // API version paths appended at point of use.
+  // Note: IAM and Cogit currently share this version path, but may version independently in the future.
+  const iamApiV1 = `${envConfig.iamBaseUrl}${API_V1_PATH}`
+  const userService = new HttpUserService({apiBaseUrl: iamApiV1})
+  const teamService = new HttpTeamService({apiBaseUrl: iamApiV1})
+  const spaceService = new HttpSpaceService({apiBaseUrl: iamApiV1})
 
   // Auth handler requires async OIDC discovery
   const discoveryService = new OidcDiscoveryService()
@@ -145,8 +153,9 @@ export async function setupFeatureHandlers({
   const contextTreeWriterService = new FileContextTreeWriterService({snapshotService: contextTreeSnapshotService})
   const contextTreeMerger = new FileContextTreeMerger({snapshotService: contextTreeSnapshotService})
   const contextFileReader = new FileContextFileReader()
-  const cogitPushService = new HttpCogitPushService({apiBaseUrl: envConfig.cogitApiBaseUrl})
-  const cogitPullService = new HttpCogitPullService({apiBaseUrl: envConfig.cogitApiBaseUrl})
+  const cogitApiV1 = `${envConfig.cogitBaseUrl}${API_V1_PATH}`
+  const cogitPushService = new HttpCogitPushService({apiBaseUrl: cogitApiV1})
+  const cogitPullService = new HttpCogitPullService({apiBaseUrl: cogitApiV1})
 
   // ConnectorManager factory — creates per-project instances since constructor binds to projectRoot
   const fileService = new FsFileService()
@@ -161,16 +170,29 @@ export async function setupFeatureHandlers({
   new StatusHandler({
     contextTreeService,
     contextTreeSnapshotService,
-    curateLogStoreFactory: (projectPath) => new FileCurateLogStore({baseDir: getProjectDataDir(projectPath)}),
+    curateLogStoreFactory: (projectPath) => new FileCurateLogStore({ baseDir: getProjectDataDir(projectPath) }),
     projectConfigStore,
     resolveProjectPath,
     tokenStore,
     transport,
+    webuiPort,
   }).setup()
 
   new LocationsHandler({
     contextTreeService,
     getActiveProjectPaths,
+    async pathExists(path: string) {
+      try {
+        await access(path)
+        return true
+      } catch (error) {
+        if (error instanceof Error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+          return false
+        }
+
+        throw error
+      }
+    },
     projectRegistry,
     resolveProjectPath,
     transport,
@@ -182,13 +204,14 @@ export async function setupFeatureHandlers({
     contextFileReader,
     contextTreeService,
     contextTreeSnapshotService,
-    curateLogStoreFactory: (projectPath) => new FileCurateLogStore({baseDir: getProjectDataDir(projectPath)}),
+    curateLogStoreFactory: (projectPath) => new FileCurateLogStore({ baseDir: getProjectDataDir(projectPath) }),
     projectConfigStore,
     resolveProjectPath,
     reviewBackupStoreFactory: (projectPath) => new FileReviewBackupStore(join(projectPath, BRV_DIR)),
     tokenStore,
     transport,
     webAppUrl: envConfig.webAppUrl,
+    webuiPort,
   }).setup()
 
   new PullHandler({
@@ -206,17 +229,18 @@ export async function setupFeatureHandlers({
   new ResetHandler({
     contextTreeService,
     contextTreeSnapshotService,
-    curateLogStoreFactory: (projectPath) => new FileCurateLogStore({baseDir: getProjectDataDir(projectPath)}),
+    curateLogStoreFactory: (projectPath) => new FileCurateLogStore({ baseDir: getProjectDataDir(projectPath) }),
     resolveProjectPath,
     reviewBackupStoreFactory: (projectPath) => new FileReviewBackupStore(join(projectPath, BRV_DIR)),
     transport,
   }).setup()
 
   new ReviewHandler({
-    curateLogStoreFactory: (projectPath) => new FileCurateLogStore({baseDir: getProjectDataDir(projectPath)}),
-    onResolved({projectPath, taskId}) {
-      broadcastToProject(projectPath, ReviewEvents.NOTIFY, {pendingCount: 0, reviewUrl: '', taskId})
+    curateLogStoreFactory: (projectPath) => new FileCurateLogStore({ baseDir: getProjectDataDir(projectPath) }),
+    onResolved({ projectPath, taskId }) {
+      broadcastToProject(projectPath, ReviewEvents.NOTIFY, { pendingCount: 0, reviewUrl: '', taskId })
     },
+    projectConfigStore,
     resolveProjectPath,
     reviewBackupStoreFactory: (projectPath) => new FileReviewBackupStore(join(projectPath, BRV_DIR)),
     transport,
@@ -243,8 +267,8 @@ export async function setupFeatureHandlers({
     transport,
   }).setup()
 
-  const skillConnectorFactory = (projectRoot: string): SkillConnector => new SkillConnector({fileService, projectRoot})
-  const hubInstallService = new HubInstallService({fileService, skillConnectorFactory})
+  const skillConnectorFactory = (projectRoot: string): SkillConnector => new SkillConnector({ fileService, projectRoot })
+  const hubInstallService = new HubInstallService({ fileService, skillConnectorFactory })
   const hubRegistryConfigStore = new HubRegistryConfigStore()
   const hubKeychainStore = createHubKeychainStore()
 
@@ -287,9 +311,17 @@ export async function setupFeatureHandlers({
     webAppUrl: envConfig.webAppUrl,
   }).setup()
 
+  new ContextTreeHandler({
+    contextFileReader,
+    contextTreeService,
+    gitService,
+    resolveProjectPath,
+    transport,
+  }).setup()
+
   // Worktree & source handlers
-  new WorktreeHandler({resolveProjectPath, transport}).setup()
-  new SourceHandler({resolveProjectPath, transport}).setup()
+  new WorktreeHandler({ resolveProjectPath, transport }).setup()
+  new SourceHandler({ resolveProjectPath, transport }).setup()
 
   log('Feature handlers registered')
 }

@@ -7,6 +7,7 @@ export const AGENT_VALUES = [
   'Auggie CLI',
   'Augment Code',
   'Claude Code',
+  'Claude Desktop',
   'Cline',
   'Codex',
   'Cursor',
@@ -15,6 +16,7 @@ export const AGENT_VALUES = [
   'Junie',
   'Kilo Code',
   'Kiro',
+  'OpenClaude',
   'OpenClaw',
   'OpenCode',
   'Qoder',
@@ -27,3 +29,5 @@ export const AGENT_VALUES = [
 ] as const
 
 export type Agent = (typeof AGENT_VALUES)[number]
+
+export const CLAUDE_DESKTOP: Agent = 'Claude Desktop'

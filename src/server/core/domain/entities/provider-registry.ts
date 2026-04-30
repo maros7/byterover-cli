@@ -98,7 +98,7 @@ export const PROVIDER_REGISTRY: Readonly<Record<string, ProviderDefinition>> = {
   byterover: {
     baseUrl: '',
     category: 'popular',
-    description: 'Built-in LLM, logged-in ByteRover account required. Limited free usage.',
+    description: 'Built-in LLM, ByteRover account required. Limited free usage.',
     headers: {},
     id: 'byterover',
     modelsEndpoint: '',
@@ -181,7 +181,7 @@ export const PROVIDER_REGISTRY: Readonly<Record<string, ProviderDefinition>> = {
     apiKeyUrl: 'https://aistudio.google.com/apikey',
     baseUrl: '',
     category: 'popular',
-    defaultModel: 'gemini-2.5-flash',
+    defaultModel: 'gemini-3-flash-preview',
     description: 'Gemini models by Google',
     envVars: ['GOOGLE_API_KEY', 'GEMINI_API_KEY'],
     headers: {},
@@ -207,7 +207,7 @@ export const PROVIDER_REGISTRY: Readonly<Record<string, ProviderDefinition>> = {
     apiKeyUrl: 'https://platform.minimax.io',
     baseUrl: 'https://api.minimax.io/v1',
     category: 'other',
-    defaultModel: 'MiniMax-M2',
+    defaultModel: 'MiniMax-M2.7',
     description: 'MiniMax AI models',
     envVars: ['MINIMAX_API_KEY'],
     headers: {},
@@ -259,7 +259,7 @@ export const PROVIDER_REGISTRY: Readonly<Record<string, ProviderDefinition>> = {
       // Public OAuth client ID (safe to commit — native app public client, no client secret)
       clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
       // OpenAI Codex model used for the ChatGPT OAuth (Codex CLI) flow
-      defaultModel: 'gpt-5.1-codex-mini',
+      defaultModel: 'gpt-5.4-mini',
       /* eslint-disable camelcase -- OAuth query params follow RFC 6749 naming */
       extraParams: {
         codex_cli_simplified_flow: 'true',
@@ -278,8 +278,7 @@ export const PROVIDER_REGISTRY: Readonly<Record<string, ProviderDefinition>> = {
   'openai-compatible': {
     baseUrl: '',
     category: 'other',
-    defaultModel: 'llama3',
-    description: 'Connect any OpenAI-compatible endpoint (Ollama, LM Studio, etc.)',
+    description: 'OpenAI-compatible endpoint (Ollama, LM Studio, etc.)',
     envVars: ['OPENAI_COMPATIBLE_API_KEY'],
     headers: {},
     id: 'openai-compatible',

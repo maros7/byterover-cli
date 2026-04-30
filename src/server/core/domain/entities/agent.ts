@@ -46,6 +46,10 @@ export const AGENT_CONNECTOR_CONFIG: Record<Agent, AgentConnectorConfig> = {
     default: 'skill',
     supported: ['rules', 'hook', 'mcp', 'skill'],
   },
+  'Claude Desktop': {
+    default: 'mcp',
+    supported: ['mcp'],
+  },
   Cline: {
     default: 'mcp',
     supported: ['rules', 'mcp'],
@@ -75,6 +79,10 @@ export const AGENT_CONNECTOR_CONFIG: Record<Agent, AgentConnectorConfig> = {
     supported: ['rules', 'mcp', 'skill'],
   },
   Kiro: {
+    default: 'skill',
+    supported: ['rules', 'mcp', 'skill'],
+  },
+  OpenClaude: {
     default: 'skill',
     supported: ['rules', 'mcp', 'skill'],
   },

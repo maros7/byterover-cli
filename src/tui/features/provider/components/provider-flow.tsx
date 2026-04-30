@@ -26,6 +26,7 @@ import {useDisconnectProvider} from '../api/disconnect-provider.js'
 import {useGetProviders} from '../api/get-providers.js'
 import {useSetActiveProvider} from '../api/set-active-provider.js'
 import {useValidateApiKey} from '../api/validate-api-key.js'
+import {derivePostLoginAction} from '../utils/derive-post-login-action.js'
 import {ApiKeyDialog} from './api-key-dialog.js'
 import {AuthMethodDialog} from './auth-method-dialog.js'
 import {BaseUrlDialog} from './base-url-dialog.js'
@@ -39,6 +40,17 @@ interface ProviderAction {
   description: string
   id: string
   name: string
+}
+
+/**
+ * Throws on transport responses that ack with `success: false` so the
+ * existing try/catch surfaces server-side errors instead of silently
+ * marching forward into the next step.
+ */
+function ensureSuccess(response: {error?: string; success: boolean}): void {
+  if (!response.success) {
+    throw new Error(response.error ?? 'Operation failed')
+  }
 }
 
 export interface ProviderFlowProps {
@@ -164,9 +176,18 @@ export const ProviderFlow: React.FC<ProviderFlowProps> = ({
       return
     }
 
-    // Already connected → show actions menu
+    // Already connected → show actions menu. Exception: openai-compatible
+    // is the only provider that can land in a connected-but-no-active-model
+    // state (no canonical defaultModel exists for arbitrary endpoints), so
+    // when it's the current provider we jump straight to the model picker
+    // so the welcome view's user can finish setup. For non-current
+    // half-configured providers we still show the actions menu so
+    // Disconnect / Set as active stay reachable (the picker would otherwise
+    // be a dead-end if the endpoint is down).
     if (provider.isConnected) {
-      setStep('provider_actions')
+      const needsModelPick =
+        provider.id === 'openai-compatible' && !provider.activeModel && provider.isCurrent
+      setStep(needsModelPick ? 'model_select' : 'provider_actions')
       return
     }
 
@@ -281,14 +302,34 @@ export const ProviderFlow: React.FC<ProviderFlowProps> = ({
     }
   }, [disconnectMutation, isAuthorized, onComplete, selectedProvider, setActiveMutation])
 
-  const handleLoginComplete = useCallback((message: string) => {
+  const handleLoginComplete = useCallback(async (message: string) => {
     const nowAuthorized = useAuthStore.getState().isAuthorized
-    if (!nowAuthorized) {
-      setError(message)
+    const action = derivePostLoginAction({
+      errorMessage: message,
+      isAuthorized: nowAuthorized,
+      selectedProviderId: selectedProvider?.id,
+    })
+
+    if (action.type === 'connect-byterover' && selectedProvider) {
+      setStep('connecting')
+      try {
+        await connectMutation.mutateAsync({providerId: selectedProvider.id})
+        await setActiveMutation.mutateAsync({providerId: selectedProvider.id})
+        onComplete(`Connected to ${selectedProvider.name}`)
+      } catch (error_) {
+        setError(formatTransportError(error_))
+        setStep('select')
+      }
+
+      return
+    }
+
+    if (action.type === 'return-to-select-with-error') {
+      setError(action.message)
     }
 
     setStep('select')
-  }, [])
+  }, [connectMutation, onComplete, selectedProvider, setActiveMutation])
 
   const handleBaseUrlSubmit = useCallback((url: string) => {
     setBaseUrl(url)
@@ -300,15 +341,22 @@ export const ProviderFlow: React.FC<ProviderFlowProps> = ({
 
     setStep('connecting')
     try {
-      await connectMutation.mutateAsync({
+      ensureSuccess(await connectMutation.mutateAsync({
         apiKey: apiKey || undefined,
         baseUrl: baseUrl || undefined,
         providerId: selectedProvider.id,
-      })
+      }))
       setStep('model_select')
     } catch (error_) {
       setError(formatTransportError(error_))
-      setStep('api_key')
+      // Server rejection (e.g. unreachable openai-compatible URL) — return to
+      // the provider list where the error is rendered. The user can re-enter
+      // the flow with a corrected URL or API key. Mirror the other failure
+      // paths (e.g. handleSelect at the byterover branch) by clearing the
+      // selected provider too.
+      setStep('select')
+      setSelectedProvider(null)
+      setBaseUrl(null)
     }
   }, [baseUrl, connectMutation, selectedProvider])
 

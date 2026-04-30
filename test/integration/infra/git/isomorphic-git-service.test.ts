@@ -1,7 +1,7 @@
 import {expect} from 'chai'
 import * as git from 'isomorphic-git'
 import fs, {existsSync} from 'node:fs'
-import {mkdir, readFile, rm, unlink, writeFile} from 'node:fs/promises'
+import {mkdir, readFile, rm, unlink, utimes, writeFile} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {stub} from 'sinon'
@@ -11,6 +11,7 @@ import type {IAuthStateStore} from '../../../../src/server/core/interfaces/state
 import {AuthToken} from '../../../../src/server/core/domain/entities/auth-token.js'
 import {GitAuthError, GitError} from '../../../../src/server/core/domain/errors/git-error.js'
 import {IsomorphicGitService} from '../../../../src/server/infra/git/isomorphic-git-service.js'
+import {classifyTuple} from '../../../../src/server/infra/git/status-row-classifier.js'
 
 const COGIT_BASE = 'https://fake-cgit.example.com'
 
@@ -355,6 +356,45 @@ describe('IsomorphicGitService', () => {
       expect(entries).to.deep.include({path: 'tracked.md', staged: false, status: 'untracked'})
     })
 
+    it('[1,2,0] git rm --cached then edit reports staged deletion + untracked', async () => {
+      await writeFile(join(testDir, 'tracked.md'), 'original')
+      await service.add({directory: testDir, filePaths: ['tracked.md']})
+      await service.commit({directory: testDir, message: 'initial'})
+
+      await git.remove({dir: testDir, filepath: 'tracked.md', fs})
+      await writeFile(join(testDir, 'tracked.md'), 'edited after rm --cached')
+
+      const matrix = await git.statusMatrix({dir: testDir, fs})
+      expect(matrix).to.deep.equal([['tracked.md', 1, 2, 0]])
+
+      const result = await service.status({directory: testDir})
+      expect(result.isClean).to.be.false
+      const entries = result.files.filter((f) => f.path === 'tracked.md')
+      expect(entries).to.have.length(2)
+      expect(entries).to.deep.include({path: 'tracked.md', staged: true, status: 'deleted'})
+      expect(entries).to.deep.include({path: 'tracked.md', staged: false, status: 'untracked'})
+    })
+
+    it('[0,0,3] staged new file then deleted from disk reports add + delete', async () => {
+      // Need an existing commit so git.statusMatrix has a HEAD to compare against.
+      await writeFile(join(testDir, 'seed.md'), 'seed')
+      await service.add({directory: testDir, filePaths: ['seed.md']})
+      await service.commit({directory: testDir, message: 'seed'})
+
+      await writeFile(join(testDir, 'fresh.md'), 'staged content')
+      await service.add({directory: testDir, filePaths: ['fresh.md']})
+      await unlink(join(testDir, 'fresh.md'))
+
+      const matrix = await git.statusMatrix({dir: testDir, fs})
+      const freshRow = matrix.find((row) => row[0] === 'fresh.md')
+      expect(freshRow).to.deep.equal(['fresh.md', 0, 0, 3])
+
+      const result = await service.status({directory: testDir})
+      const entries = result.files.filter((f) => f.path === 'fresh.md')
+      expect(entries).to.deep.include({path: 'fresh.md', staged: true, status: 'added'})
+      expect(entries).to.deep.include({path: 'fresh.md', staged: false, status: 'deleted'})
+    })
+
     it('[0,2,3] reports partially staged new file as staged added + unstaged modified', async () => {
       // new file: add to index (staged added), then modify on disk without re-staging
       await writeFile(join(testDir, 'new.md'), 'original')
@@ -367,6 +407,66 @@ describe('IsomorphicGitService', () => {
       expect(entries).to.have.length(2)
       expect(entries).to.deep.include({path: 'new.md', staged: true, status: 'added'})
       expect(entries).to.deep.include({path: 'new.md', staged: false, status: 'modified'})
+    })
+
+    it('[1,1,3] reports both staged + unstaged modifications when workdir is restored to HEAD after add', async () => {
+      // Reachable in the wild via editor undo+autosave, AI agent revert, or sync-tool rollback
+      // after `brv vc add`: workdir matches HEAD, but the index still holds the staged blob.
+      // Native git reports BOTH a staged modification (HEAD->INDEX) AND an unstaged
+      // modification (INDEX->WORKDIR), since INDEX differs from both.
+      const tracked = join(testDir, 'tracked.md')
+      await writeFile(tracked, 'v1\n')
+      await service.add({directory: testDir, filePaths: ['tracked.md']})
+      await service.commit({directory: testDir, message: 'initial'})
+
+      await writeFile(tracked, 'v2\n')
+      await service.add({directory: testDir, filePaths: ['tracked.md']})
+
+      // Filesystem-only restore to HEAD content; index untouched.
+      // Force a distinct mtime so isomorphic-git re-reads the workdir blob instead of
+      // trusting the index's stat cache (which would yield [1,2,2] otherwise).
+      await writeFile(tracked, 'v1\n')
+      const future = new Date(Date.now() + 2000)
+      await utimes(tracked, future, future)
+
+      const matrix = await git.statusMatrix({dir: testDir, fs})
+      expect(matrix).to.deep.equal([['tracked.md', 1, 1, 3]])
+
+      const result = await service.status({directory: testDir})
+
+      expect(result.isClean).to.be.false
+      const entries = result.files.filter((f) => f.path === 'tracked.md')
+      expect(entries).to.have.length(2)
+      expect(entries).to.deep.include({path: 'tracked.md', staged: true, status: 'modified'})
+      expect(entries).to.deep.include({path: 'tracked.md', staged: false, status: 'modified'})
+    })
+
+    it('status.isClean implies pull dirty-filter sees no rows (cross-property invariant)', async () => {
+      // Engineer the [1,1,3] tuple. status() and pull() must agree on cleanliness:
+      // both project the matrix through classifyTuple, so the dirty set computed
+      // here must mirror what pull() actually inspects internally.
+      const path = join(testDir, 'a.md')
+      await writeFile(path, 'v1\n')
+      await service.add({directory: testDir, filePaths: ['a.md']})
+      await service.commit({directory: testDir, message: 'initial'})
+
+      await writeFile(path, 'v2\n')
+      await service.add({directory: testDir, filePaths: ['a.md']})
+      await writeFile(path, 'v1\n')
+      const future = new Date(Date.now() + 2000)
+      await utimes(path, future, future)
+
+      const status = await service.status({directory: testDir})
+      const matrix = await git.statusMatrix({dir: testDir, fs})
+      const pullDirty = matrix
+        .filter(([, head, workdir, stage]) => classifyTuple(head, workdir, stage).dirty)
+        .map((row) => String(row[0]))
+
+      if (status.isClean) {
+        expect(pullDirty, 'pull would consider files dirty while status reports clean').to.deep.equal([])
+      } else {
+        expect(status.files.map((f) => f.path)).to.include.members(pullDirty)
+      }
     })
 
     it('reports correct statuses for multiple files with mixed states', async () => {
@@ -432,6 +532,32 @@ describe('IsomorphicGitService', () => {
       const commits = await service.log({depth: 1, directory: testDir})
       expect(commits).to.have.length(1)
     })
+
+    it('filters commits by filepath', async () => {
+      await writeFile(join(testDir, 'a.md'), 'a')
+      await service.add({directory: testDir, filePaths: ['a.md']})
+      await service.commit({directory: testDir, message: 'add a'})
+
+      await writeFile(join(testDir, 'b.md'), 'b')
+      await service.add({directory: testDir, filePaths: ['b.md']})
+      await service.commit({directory: testDir, message: 'add b'})
+
+      await writeFile(join(testDir, 'a.md'), 'a updated')
+      await service.add({directory: testDir, filePaths: ['a.md']})
+      await service.commit({directory: testDir, message: 'update a'})
+
+      const allCommits = await service.log({directory: testDir})
+      expect(allCommits).to.have.length(3)
+
+      const aCommits = await service.log({directory: testDir, filepath: 'a.md'})
+      expect(aCommits).to.have.length(2)
+      expect(aCommits[0].message).to.equal('update a')
+      expect(aCommits[1].message).to.equal('add a')
+
+      const bCommits = await service.log({directory: testDir, filepath: 'b.md'})
+      expect(bCommits).to.have.length(1)
+      expect(bCommits[0].message).to.equal('add b')
+    })
   })
 
   // ---- createBranch() + listBranches() + getCurrentBranch() ----
@@ -494,6 +620,20 @@ describe('IsomorphicGitService', () => {
       } catch (error) {
         expect(error).to.be.an('error')
       }
+    })
+
+    it('createBranch with startPoint creates branch pointing at that ref', async () => {
+      // Capture HEAD SHA at "seed", then add a second commit on main.
+      const [seedCommit] = await service.log({depth: 1, directory: testDir})
+      await writeFile(join(testDir, 'later.md'), 'later')
+      await service.add({directory: testDir, filePaths: ['later.md']})
+      await service.commit({directory: testDir, message: 'later'})
+
+      // Branch 'from-seed' should point at seed, not at HEAD.
+      await service.createBranch({branch: 'from-seed', directory: testDir, startPoint: seedCommit.sha})
+
+      const branchLog = await service.log({depth: 1, directory: testDir, ref: 'from-seed'})
+      expect(branchLog[0].sha).to.equal(seedCommit.sha)
     })
 
     it('createBranch and deleteBranch work with slash in name (feature/test)', async () => {
@@ -622,32 +762,31 @@ describe('IsomorphicGitService', () => {
       expect(conflicts).to.be.empty
     })
 
-    it('detects both_modified conflict when MERGE_HEAD exists', async () => {
-      // Commit a tracked file so statusMatrix has baseline
+    it('detects both_modified conflict after a real merge', async () => {
+      // Common ancestor with the tracked file
       await writeFile(join(testDir, 'file.md'), 'initial')
       await service.add({directory: testDir, filePaths: ['file.md']})
       await service.commit({directory: testDir, message: 'initial'})
 
-      // Simulate native git merge conflict state:
-      // native git writes MERGE_HEAD and conflict markers; isomorphic-git does not
-      await writeFile(join(testDir, '.git', 'MERGE_HEAD'), 'deadbeef\n')
-      await writeFile(join(testDir, 'file.md'), '<<<<<<< HEAD\nmain\n=======\nfeature\n>>>>>>> feature')
+      // Diverge: feature branch modifies file
+      await service.createBranch({branch: 'feature', directory: testDir})
+      await service.checkout({directory: testDir, ref: 'feature'})
+      await writeFile(join(testDir, 'file.md'), 'feature version')
+      await service.add({directory: testDir, filePaths: ['file.md']})
+      await service.commit({directory: testDir, message: 'feature change'})
+
+      // main also modifies file → conflicting change
+      await service.checkout({directory: testDir, ref: 'main'})
+      await writeFile(join(testDir, 'file.md'), 'main version')
+      await service.add({directory: testDir, filePaths: ['file.md']})
+      await service.commit({directory: testDir, message: 'main change'})
+
+      await service.merge({branch: 'feature', directory: testDir})
 
       const conflicts = await service.getConflicts({directory: testDir})
       expect(conflicts).to.have.length(1)
       expect(conflicts[0].path).to.equal('file.md')
       expect(conflicts[0].type).to.equal('both_modified')
-    })
-
-    it('detects both_added conflict when new file has conflict markers', async () => {
-      // File does NOT exist in HEAD (never committed), appears in workdir with conflict markers
-      await writeFile(join(testDir, '.git', 'MERGE_HEAD'), 'deadbeef\n')
-      await writeFile(join(testDir, 'brand-new.md'), '<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch')
-
-      const conflicts = await service.getConflicts({directory: testDir})
-      expect(conflicts).to.have.length(1)
-      expect(conflicts[0].path).to.equal('brand-new.md')
-      expect(conflicts[0].type).to.equal('both_added')
     })
 
     it('detects deleted_modified conflict when tracked file is deleted from workdir', async () => {
@@ -666,15 +805,26 @@ describe('IsomorphicGitService', () => {
     })
 
     it('detects conflicts in nested directories', async () => {
-      // Commit a tracked nested file
+      // Common ancestor with a nested tracked file
       await mkdir(join(testDir, 'sub'), {recursive: true})
       await writeFile(join(testDir, 'sub', 'nested.md'), 'initial')
       await service.add({directory: testDir, filePaths: ['sub/nested.md']})
       await service.commit({directory: testDir, message: 'initial'})
 
-      // Simulate native git merge conflict state
-      await writeFile(join(testDir, '.git', 'MERGE_HEAD'), 'deadbeef\n')
-      await writeFile(join(testDir, 'sub', 'nested.md'), '<<<<<<< HEAD\nmain\n=======\nfeature\n>>>>>>> feature')
+      // Diverge: feature modifies nested file
+      await service.createBranch({branch: 'feature', directory: testDir})
+      await service.checkout({directory: testDir, ref: 'feature'})
+      await writeFile(join(testDir, 'sub', 'nested.md'), 'feature version')
+      await service.add({directory: testDir, filePaths: ['sub/nested.md']})
+      await service.commit({directory: testDir, message: 'feature change'})
+
+      // main also modifies → conflicting change
+      await service.checkout({directory: testDir, ref: 'main'})
+      await writeFile(join(testDir, 'sub', 'nested.md'), 'main version')
+      await service.add({directory: testDir, filePaths: ['sub/nested.md']})
+      await service.commit({directory: testDir, message: 'main change'})
+
+      await service.merge({branch: 'feature', directory: testDir})
 
       const conflicts = await service.getConflicts({directory: testDir})
       expect(conflicts).to.have.length(1)
@@ -1317,4 +1467,234 @@ describe('IsomorphicGitService', () => {
     })
   })
 
+  // ---- diff primitives (listChangedFiles, getOid, hashBlob, getBlobContent at commitish) ----
+
+  describe('listChangedFiles()', () => {
+    describe('unstaged: STAGE -> WORKDIR', () => {
+      it('returns modified files (workdir differs from stage)', async () => {
+        await service.init({directory: testDir})
+        await initWithCommit(service, testDir, 'a.md', 'short\n', 'c1')
+        // Different length so isomorphic-git's stat-based fast path can't skip the content read.
+        await writeFile(join(testDir, 'a.md'), 'a much longer line of content\n')
+
+        const changes = await service.listChangedFiles({directory: testDir, from: 'STAGE', to: 'WORKDIR'})
+        expect(changes).to.deep.equal([{path: 'a.md', status: 'modified'}])
+      })
+
+      it('returns deleted files (present in stage, missing from workdir)', async () => {
+        await service.init({directory: testDir})
+        await initWithCommit(service, testDir, 'gone.md', 'v1\n', 'c1')
+        await unlink(join(testDir, 'gone.md'))
+
+        const changes = await service.listChangedFiles({directory: testDir, from: 'STAGE', to: 'WORKDIR'})
+        expect(changes).to.deep.equal([{path: 'gone.md', status: 'deleted'}])
+      })
+
+      it('excludes untracked files (matches `git diff` no-args behavior)', async () => {
+        await service.init({directory: testDir})
+        await initWithCommit(service, testDir, 'tracked.md', 'v1\n', 'c1')
+        await writeFile(join(testDir, 'untracked.md'), 'untracked\n')
+
+        const changes = await service.listChangedFiles({directory: testDir, from: 'STAGE', to: 'WORKDIR'})
+        expect(changes).to.deep.equal([])
+      })
+    })
+
+    describe('staged: HEAD -> STAGE', () => {
+      it('returns added files (staged but not in HEAD)', async () => {
+        await service.init({directory: testDir})
+        await initWithCommit(service, testDir, 'a.md', 'v1\n', 'c1')
+        await writeFile(join(testDir, 'b.md'), 'new\n')
+        await service.add({directory: testDir, filePaths: ['b.md']})
+
+        const changes = await service.listChangedFiles({
+          directory: testDir,
+          from: {commitish: 'HEAD'},
+          to: 'STAGE',
+        })
+        expect(changes).to.deep.equal([{path: 'b.md', status: 'added'}])
+      })
+
+      it('returns modified files (staged change differs from HEAD)', async () => {
+        await service.init({directory: testDir})
+        await initWithCommit(service, testDir, 'a.md', 'v1\n', 'c1')
+        await writeFile(join(testDir, 'a.md'), 'v2\n')
+        await service.add({directory: testDir, filePaths: ['a.md']})
+
+        const changes = await service.listChangedFiles({
+          directory: testDir,
+          from: {commitish: 'HEAD'},
+          to: 'STAGE',
+        })
+        expect(changes).to.deep.equal([{path: 'a.md', status: 'modified'}])
+      })
+    })
+
+    describe('range: commit-vs-commit', () => {
+      it('returns all 3 statuses across two commits', async () => {
+        await service.init({directory: testDir})
+        await initWithCommit(service, testDir, 'kept.md', 'k1\n', 'c1')
+        await initWithCommit(service, testDir, 'modified.md', 'm1\n', 'c2')
+        const sha2 = await initWithCommit(service, testDir, 'deleted.md', 'd1\n', 'c3')
+
+        // Now create the "to" commit: modify, delete, and add
+        await writeFile(join(testDir, 'modified.md'), 'm2\n')
+        await unlink(join(testDir, 'deleted.md'))
+        await writeFile(join(testDir, 'added.md'), 'new\n')
+        await service.add({directory: testDir, filePaths: ['modified.md', 'added.md']})
+        // Stage the deletion explicitly
+        await git.remove({dir: testDir, filepath: 'deleted.md', fs})
+        const c4 = await service.commit({directory: testDir, message: 'c4'})
+
+        const changes = await service.listChangedFiles({
+          directory: testDir,
+          from: {commitish: sha2},
+          to: {commitish: c4.sha},
+        })
+        const byPath = Object.fromEntries(changes.map((c) => [c.path, c.status]))
+        expect(byPath).to.deep.equal({
+          'added.md': 'added',
+          'deleted.md': 'deleted',
+          'modified.md': 'modified',
+        })
+      })
+    })
+
+    describe('ref-vs-worktree', () => {
+      it('reports modifications between a commit and the working tree', async () => {
+        await service.init({directory: testDir})
+        await initWithCommit(service, testDir, 'a.md', 'v1\n', 'c1')
+        await writeFile(join(testDir, 'a.md'), 'v2\n')
+        await service.add({directory: testDir, filePaths: ['a.md']})
+
+        const changes = await service.listChangedFiles({
+          directory: testDir,
+          from: {commitish: 'HEAD'},
+          to: 'WORKDIR',
+        })
+        expect(changes).to.deep.equal([{path: 'a.md', status: 'modified'}])
+      })
+
+      it('reports deleted file vs commit', async () => {
+        await service.init({directory: testDir})
+        await initWithCommit(service, testDir, 'old.md', 'v1\n', 'c1')
+        await unlink(join(testDir, 'old.md'))
+
+        const changes = await service.listChangedFiles({
+          directory: testDir,
+          from: {commitish: 'HEAD'},
+          to: 'WORKDIR',
+        })
+        expect(changes).to.deep.equal([{path: 'old.md', status: 'deleted'}])
+      })
+
+      it('excludes untracked files (matches `git diff <commit>` behavior)', async () => {
+        await service.init({directory: testDir})
+        await initWithCommit(service, testDir, 'committed.md', 'v1\n', 'c1')
+        // Untracked file — real `git diff HEAD` does NOT report this.
+        await writeFile(join(testDir, 'untracked.md'), 'fresh\n')
+
+        const changes = await service.listChangedFiles({
+          directory: testDir,
+          from: {commitish: 'HEAD'},
+          to: 'WORKDIR',
+        })
+        expect(changes).to.deep.equal([])
+      })
+
+      it('reports staged-new files vs commit (in index but not in source ref)', async () => {
+        await service.init({directory: testDir})
+        await initWithCommit(service, testDir, 'committed.md', 'v1\n', 'c1')
+        await writeFile(join(testDir, 'staged.md'), 'fresh\n')
+        await service.add({directory: testDir, filePaths: ['staged.md']})
+
+        const changes = await service.listChangedFiles({
+          directory: testDir,
+          from: {commitish: 'HEAD'},
+          to: 'WORKDIR',
+        })
+        expect(changes).to.deep.equal([{path: 'staged.md', status: 'added'}])
+      })
+    })
+  })
+
+  describe('getTextBlob()', () => {
+    it('returns content + 7-char short oid for a file at HEAD', async () => {
+      await service.init({directory: testDir})
+      await initWithCommit(service, testDir, 'a.md', 'hello\n', 'c1')
+
+      const blob = await service.getTextBlob({directory: testDir, path: 'a.md', ref: {commitish: 'HEAD'}})
+      expect(blob).to.not.equal(undefined)
+      expect(blob?.content).to.equal('hello\n')
+      expect(blob?.oid).to.have.lengthOf(7)
+      expect(blob?.oid).to.match(/^[\da-f]{7}$/)
+    })
+
+    it('returns content + oid for a staged file', async () => {
+      await service.init({directory: testDir})
+      await writeFile(join(testDir, 'b.md'), 'staged\n')
+      await service.add({directory: testDir, filePaths: ['b.md']})
+
+      const blob = await service.getTextBlob({directory: testDir, path: 'b.md', ref: 'STAGE'})
+      expect(blob?.content).to.equal('staged\n')
+      expect(blob?.oid).to.have.lengthOf(7)
+    })
+
+    it('returns undefined for a non-existent file', async () => {
+      await service.init({directory: testDir})
+      await initWithCommit(service, testDir, 'a.md', 'hello\n', 'c1')
+
+      const blob = await service.getTextBlob({directory: testDir, path: 'missing.md', ref: {commitish: 'HEAD'}})
+      expect(blob).to.equal(undefined)
+    })
+
+    it('marks a binary blob (contains NUL byte) with binary:true and empty content', async () => {
+      await service.init({directory: testDir})
+      // Commit a file containing a NUL byte.
+      await writeFile(join(testDir, 'logo.bin'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01]))
+      await service.add({directory: testDir, filePaths: ['logo.bin']})
+      await service.commit({directory: testDir, message: 'add binary'})
+
+      const blob = await service.getTextBlob({directory: testDir, path: 'logo.bin', ref: {commitish: 'HEAD'}})
+      expect(blob).to.not.equal(undefined)
+      expect(blob?.binary).to.equal(true)
+      expect(blob?.content).to.equal('')
+      expect(blob?.oid).to.have.lengthOf(7)
+    })
+  })
+
+  describe('hashBlob()', () => {
+    it('returns the same 7-char short oid that git would compute for the content', async () => {
+      await service.init({directory: testDir})
+      await initWithCommit(service, testDir, 'a.md', 'hello\n', 'c1')
+
+      const blob = await service.getTextBlob({directory: testDir, path: 'a.md', ref: {commitish: 'HEAD'}})
+      const hashed = await service.hashBlob(Buffer.from('hello\n', 'utf8'))
+      expect(hashed).to.equal(blob?.oid)
+    })
+  })
+
+  describe('getBlobContent() at commit-ish', () => {
+    it('reads a file blob at HEAD via {commitish}', async () => {
+      await service.init({directory: testDir})
+      await initWithCommit(service, testDir, 'a.md', 'committed\n', 'c1')
+      await writeFile(join(testDir, 'a.md'), 'modified\n')
+
+      const content = await service.getBlobContent({
+        directory: testDir,
+        path: 'a.md',
+        ref: {commitish: 'HEAD'},
+      })
+      expect(content).to.equal('committed\n')
+    })
+
+    it('reads a file blob at an arbitrary commit SHA', async () => {
+      await service.init({directory: testDir})
+      const sha1 = await initWithCommit(service, testDir, 'a.md', 'v1\n', 'c1')
+      await initWithCommit(service, testDir, 'a.md', 'v2\n', 'c2')
+
+      const content = await service.getBlobContent({directory: testDir, path: 'a.md', ref: {commitish: sha1}})
+      expect(content).to.equal('v1\n')
+    })
+  })
 })

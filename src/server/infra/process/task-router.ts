@@ -31,6 +31,10 @@ import type {
   TaskCreateResponse,
   TaskErrorEvent,
   TaskExecute,
+  TaskListItem,
+  TaskListItemStatus,
+  TaskListRequest,
+  TaskListResponse,
   TaskStartedEvent,
 } from '../../core/domain/transport/schemas.js'
 import type {IAgentPool} from '../../core/interfaces/agent/i-agent-pool.js'
@@ -66,12 +70,42 @@ type LlmEventPayloadMap = {
  */
 const TASK_CLEANUP_GRACE_PERIOD_MS = 5000
 
+/**
+ * Outcome of the daemon-side pre-dispatch check.
+ *
+ * `skipResult` is the full string sent to the client as the task:completed `result`.
+ * The callback owns the message format so task-router stays task-type-agnostic
+ * (e.g. dream uses "Dream skipped: <reason>"; future task types can use their own).
+ */
+export type PreDispatchCheckResult = {eligible: false; skipResult: string} | {eligible: true}
+
+export type PreDispatchCheck = (task: TaskCreateRequest, projectPath?: string) => Promise<PreDispatchCheckResult>
+
+/**
+ * Resolves whether the review log is disabled for the given project. Called once
+ * at task-create and the result is stamped onto TaskInfo + TaskExecute, so daemon
+ * (CurateLogHandler) and agent (curate backups, dream review entries) observe a
+ * single value across the daemon→agent process boundary. Errors → undefined →
+ * downstream treats as enabled (fail-open).
+ */
+export type IsReviewDisabledResolver = (projectPath: string) => Promise<boolean>
+
 type TaskRouterOptions = {
   agentPool?: IAgentPool
   /** Function to resolve agent clientId for a given project */
   getAgentForProject: (projectPath?: string) => string | undefined
+  /** Resolves project's review-disabled flag at task-create. Optional; missing → undefined → enabled. */
+  isReviewDisabled?: IsReviewDisabledResolver
   /** Lifecycle hooks for task events (e.g. CurateLogHandler). */
   lifecycleHooks?: ITaskLifecycleHook[]
+  /**
+   * Optional daemon-side gate run before dispatching to the agent pool. If it
+   * resolves ineligible, task-router short-circuits with task:completed carrying
+   * the skip reason and never submits the task to an agent.
+   * Used for dream task type to enforce gates 1-3 (time, activity, queue) even
+   * on the CLI dispatch path — mirrors the idle-trigger pre-check pattern.
+   */
+  preDispatchCheck?: PreDispatchCheck
   projectRegistry?: IProjectRegistry
   projectRouter?: IProjectRouter
   /** Resolves the projectPath a client registered with (from client:register). */
@@ -83,6 +117,24 @@ function hasTaskId(data: unknown): data is {[key: string]: unknown; taskId: stri
   return typeof data === 'object' && data !== null && 'taskId' in data && typeof data.taskId === 'string'
 }
 
+function toListItem(task: TaskInfo): TaskListItem {
+  const status: TaskListItemStatus = task.status ?? (task.completedAt ? 'completed' : task.startedAt ? 'started' : 'created')
+  return {
+    ...(task.completedAt ? {completedAt: task.completedAt} : {}),
+    content: task.content,
+    createdAt: task.createdAt,
+    ...(task.error ? {error: task.error} : {}),
+    ...(task.files && task.files.length > 0 ? {files: task.files} : {}),
+    ...(task.folderPath ? {folderPath: task.folderPath} : {}),
+    ...(task.projectPath ? {projectPath: task.projectPath} : {}),
+    ...(task.result ? {result: task.result} : {}),
+    ...(task.startedAt ? {startedAt: task.startedAt} : {}),
+    status,
+    taskId: task.taskId,
+    type: task.type,
+  }
+}
+
 export class TaskRouter {
   private readonly agentPool: IAgentPool | undefined
   /**
@@ -91,7 +143,9 @@ export class TaskRouter {
    */
   private completedTasks: Map<string, {completedAt: number; task: TaskInfo}> = new Map()
   private readonly getAgentForProject: (projectPath?: string) => string | undefined
+  private readonly isReviewDisabled: IsReviewDisabledResolver | undefined
   private readonly lifecycleHooks: ITaskLifecycleHook[]
+  private readonly preDispatchCheck: TaskRouterOptions['preDispatchCheck']
   private readonly projectRegistry: IProjectRegistry | undefined
   private readonly projectRouter: IProjectRouter | undefined
   private readonly resolveClientProjectPath: ((clientId: string) => string | undefined) | undefined
@@ -103,7 +157,9 @@ export class TaskRouter {
     this.transport = options.transport
     this.agentPool = options.agentPool
     this.getAgentForProject = options.getAgentForProject
+    this.isReviewDisabled = options.isReviewDisabled
     this.lifecycleHooks = options.lifecycleHooks ?? []
+    this.preDispatchCheck = options.preDispatchCheck
     this.projectRegistry = options.projectRegistry
     this.projectRouter = options.projectRouter
     this.resolveClientProjectPath = options.resolveClientProjectPath
@@ -193,6 +249,11 @@ export class TaskRouter {
       this.handleTaskCancel(data, clientId),
     )
 
+    // Snapshot query from clients (e.g. web UI Tasks tab)
+    this.transport.onRequest<TaskListRequest, TaskListResponse>(TransportTaskEventNames.LIST, (data, clientId) =>
+      this.handleTaskList(data, clientId),
+    )
+
     // Task lifecycle events from agent
     this.transport.onRequest<TaskStartedEvent, void>(TransportTaskEventNames.STARTED, (data) => {
       this.handleTaskStarted(data)
@@ -252,6 +313,11 @@ export class TaskRouter {
 
   private handleTaskCancelled(data: TaskCancelledEvent): void {
     const {taskId} = data
+    const existing = this.tasks.get(taskId)
+    if (existing) {
+      this.tasks.set(taskId, {...existing, completedAt: Date.now(), status: 'cancelled'})
+    }
+
     const task = this.tasks.get(taskId)
 
     transportLog(`Task cancelled: ${taskId}`)
@@ -277,7 +343,12 @@ export class TaskRouter {
   }
 
   private handleTaskCompleted(data: TaskCompletedEvent): void {
-    const {result, taskId} = data
+    const {logId: eventLogId, result, taskId} = data
+    const existing = this.tasks.get(taskId)
+    if (existing) {
+      this.tasks.set(taskId, {...existing, completedAt: Date.now(), result, status: 'completed'})
+    }
+
     const task = this.tasks.get(taskId)
 
     transportLog(`Task completed: ${taskId}`)
@@ -296,9 +367,12 @@ export class TaskRouter {
       }
     }
 
+    // Prefer logId from lifecycle hooks (curate), fall back to executor-provided logId (dream)
+    const resolvedLogId = task?.logId ?? eventLogId
+
     if (task) {
       this.transport.sendTo(task.clientId, TransportTaskEventNames.COMPLETED, {
-        ...(task.logId ? {logId: task.logId} : {}),
+        ...(resolvedLogId ? {logId: resolvedLogId} : {}),
         ...hookData,
         result,
         taskId,
@@ -311,7 +385,7 @@ export class TaskRouter {
       task?.projectPath,
       TransportTaskEventNames.COMPLETED,
       {
-        ...(task?.logId ? {logId: task.logId} : {}),
+        ...(resolvedLogId ? {logId: resolvedLogId} : {}),
         ...hookData,
         result,
         taskId,
@@ -320,9 +394,12 @@ export class TaskRouter {
     )
     this.moveToCompleted(taskId)
 
-    // Notify pool so it can clear busy flag and drain queued tasks
-    if (task?.projectPath) {
-      this.agentPool?.notifyTaskCompleted(task.projectPath)
+    // Notify pool so it can clear busy flag and drain queued tasks.
+    // Fallback to data.projectPath for daemon-submitted tasks (e.g. idle dream)
+    // that bypass handleTaskCreate and are not registered in this.tasks.
+    const projectPath = task?.projectPath ?? data.projectPath
+    if (projectPath) {
+      this.agentPool?.notifyTaskCompleted(projectPath)
     }
 
     // Notify hooks (fire-and-forget)
@@ -430,6 +507,7 @@ export class TaskRouter {
       clientId,
       content: data.content,
       createdAt: Date.now(),
+      status: 'created',
       ...(data.clientCwd ? {clientCwd: data.clientCwd} : {}),
       ...(data.files?.length ? {files: data.files} : {}),
       ...(data.folderPath ? {folderPath: data.folderPath} : {}),
@@ -445,6 +523,7 @@ export class TaskRouter {
       content: data.content,
       ...(data.clientCwd ? {clientCwd: data.clientCwd} : {}),
       ...(data.files?.length ? {files: data.files} : {}),
+      ...(data.folderPath ? {folderPath: data.folderPath} : {}),
       taskId,
       type: data.type,
     }
@@ -460,7 +539,19 @@ export class TaskRouter {
       clientId,
     )
 
-    // ── Await lifecycle hooks ─────────────────────────────────────────────────
+    // ── Snapshot reviewDisabled + await lifecycle hooks ───────────────────────
+
+    // Snapshot the project's review-disabled flag once at the task-create boundary.
+    // Placed after the synchronous tasks.set/task:created so callers that don't
+    // await the create handler still see the task in this.tasks immediately.
+    // The value is stamped onto TaskInfo (for CurateLogHandler) and TaskExecute
+    // (forwarded to the agent) so both sides observe a single consistent value
+    // even if the user toggles mid-task. Errors → undefined → fail-open enabled.
+    const reviewDisabled = await this.snapshotReviewDisabled(projectPath)
+    const taskAfterSnapshot = this.tasks.get(taskId)
+    if (taskAfterSnapshot && reviewDisabled !== undefined) {
+      this.tasks.set(taskId, {...taskAfterSnapshot, reviewDisabled})
+    }
 
     const logId = await this.runCreateHooks(taskId)
     const task = this.tasks.get(taskId)
@@ -475,6 +566,31 @@ export class TaskRouter {
       taskId,
     })
 
+    // ── Daemon-side pre-dispatch gate (dream uses this for gates 1-3) ────────
+    // Runs after ack so the client has a logId to correlate; short-circuits with
+    // task:completed + skip-reason when ineligible. Mirrors the idle-trigger
+    // pattern in brv-server.ts:260 for the CLI dispatch path.
+
+    if (this.preDispatchCheck) {
+      let check: PreDispatchCheckResult = {eligible: true}
+      try {
+        check = await this.preDispatchCheck(data, projectPath)
+      } catch (error_) {
+        transportLog(
+          `preDispatchCheck threw for task ${taskId}, proceeding with dispatch: ${error_ instanceof Error ? error_.message : String(error_)}`,
+        )
+      }
+
+      if (!check.eligible) {
+        transportLog(`Task ${taskId} (type=${data.type}) skipped by daemon pre-check: ${check.skipResult}`)
+        // Use the skip-specific handler so the pool's activeTasks counter and
+        // onTaskCompleted hooks aren't notified for a task that never reached
+        // submitTask. See handleTaskSkippedByPreCheck for rationale.
+        this.handleTaskSkippedByPreCheck(taskId, check.skipResult)
+        return {taskId}
+      }
+    }
+
     // ── Submit to AgentPool (fire-and-forget) ─────────────────────────────────
 
     const executeMsg: TaskExecute = {
@@ -483,7 +599,9 @@ export class TaskRouter {
       ...(data.clientCwd ? {clientCwd: data.clientCwd} : {}),
       ...(data.files?.length ? {files: data.files} : {}),
       ...(data.folderPath ? {folderPath: data.folderPath} : {}),
+      ...(data.force === undefined ? {} : {force: data.force}),
       ...(projectPath ? {projectPath} : {}),
+      ...(reviewDisabled === undefined ? {} : {reviewDisabled}),
       taskId,
       type: data.type,
       ...(worktreeRoot ? {worktreeRoot} : {}),
@@ -563,6 +681,11 @@ export class TaskRouter {
 
   private handleTaskError(data: TaskErrorEvent): void {
     const {error, taskId} = data
+    const existing = this.tasks.get(taskId)
+    if (existing) {
+      this.tasks.set(taskId, {...existing, completedAt: Date.now(), error, status: 'error'})
+    }
+
     const task = this.tasks.get(taskId)
 
     transportLog(`Task error: ${taskId} - [${error.code}] ${error.message}`)
@@ -589,9 +712,11 @@ export class TaskRouter {
     )
     this.moveToCompleted(taskId)
 
-    // Notify pool so it can clear busy flag and drain queued tasks
-    if (task?.projectPath) {
-      this.agentPool?.notifyTaskCompleted(task.projectPath)
+    // Notify pool so it can clear busy flag and drain queued tasks.
+    // Fallback to data.projectPath for daemon-submitted tasks (e.g. idle dream).
+    const errorProjectPath = task?.projectPath ?? data.projectPath
+    if (errorProjectPath) {
+      this.agentPool?.notifyTaskCompleted(errorProjectPath)
     }
 
     // Notify hooks (fire-and-forget)
@@ -600,10 +725,74 @@ export class TaskRouter {
     }
   }
 
+  private handleTaskList(data: TaskListRequest, clientId: string): TaskListResponse {
+    const projectFilter = data.projectPath ?? this.resolveClientProjectPath?.(clientId)
+
+    // No resolvable project — return empty rather than leaking every task.
+    // A client that hasn't registered a project shouldn't see other projects' work.
+    if (projectFilter === undefined) return {tasks: []}
+
+    const matches = (taskProject?: string): boolean =>
+      taskProject === projectFilter || taskProject === undefined
+
+    const items: TaskListItem[] = []
+
+    for (const task of this.tasks.values()) {
+      if (!matches(task.projectPath)) continue
+      items.push(toListItem(task))
+    }
+
+    for (const {task} of this.completedTasks.values()) {
+      if (!matches(task.projectPath)) continue
+      items.push(toListItem(task))
+    }
+
+    return {tasks: items}
+  }
+
+  /**
+   * Emit `task:completed` for a task that the daemon's pre-dispatch gate skipped
+   * before it ever reached `AgentPool.submitTask`.
+   *
+   * Distinct from {@link handleTaskCompleted}:
+   *   - does NOT call `agentPool.notifyTaskCompleted` (the pool's `activeTasks`
+   *     counter was never incremented, so decrementing here would undercount real
+   *     load and let `drainQueue` dispatch an extra queued task)
+   *   - does NOT fire `onTaskCompleted` lifecycle hooks (counters/metrics that
+   *     act on completed tasks should not see pre-check skips as completions)
+   *
+   * Still emits the event to the client and the project room so REPL/TUI
+   * receive the skip result, and still calls `moveToCompleted` so the task is
+   * removed from the active set.
+   */
+  private handleTaskSkippedByPreCheck(taskId: string, result: string): void {
+    const task = this.tasks.get(taskId)
+
+    transportLog(`Task skipped by pre-dispatch gate: ${taskId}`)
+
+    if (task) {
+      this.transport.sendTo(task.clientId, TransportTaskEventNames.COMPLETED, {
+        result,
+        taskId,
+      })
+    }
+
+    broadcastToProjectRoom(
+      this.projectRegistry,
+      this.projectRouter,
+      task?.projectPath,
+      TransportTaskEventNames.COMPLETED,
+      {result, taskId},
+      task?.clientId,
+    )
+    this.moveToCompleted(taskId)
+  }
+
   private handleTaskStarted(data: TaskStartedEvent): void {
     const {taskId} = data
     const task = this.tasks.get(taskId)
     if (task) {
+      this.tasks.set(taskId, {...task, startedAt: Date.now(), status: 'started'})
       this.transport.sendTo(task.clientId, TransportTaskEventNames.STARTED, {taskId})
 
       broadcastToProjectRoom(
@@ -819,5 +1008,34 @@ export class TaskRouter {
     )
 
     return logIds.find((id): id is string => typeof id === 'string')
+  }
+
+  /**
+   * Reads the project's reviewDisabled flag at task-create.
+   *
+   * Returns `undefined` only when no resolver is wired or no projectPath was
+   * resolved — those are legitimate "not configured" cases where downstream
+   * consumers fall back to their own resolution path.
+   *
+   * On resolver THROW, returns the explicit boolean `false` (review enabled =
+   * fail-open) so the daemon and the agent observe a single concrete value.
+   * Returning `undefined` here would re-introduce the exact divergence the
+   * snapshot is supposed to prevent: daemon stamps no field → CurateLogHandler
+   * uses `?? false` (enabled) while the agent process opens no ALS scope and
+   * may read `reviewDisabled: true` from `.brv/config.json` in the
+   * curate-tool fallback, producing pending review entries without backups
+   * (or vice versa). Aligns with the agent-side `isReviewDisabledForBrvDir`
+   * which also fails open.
+   */
+  private async snapshotReviewDisabled(projectPath: string | undefined): Promise<boolean | undefined> {
+    if (!this.isReviewDisabled || !projectPath) return undefined
+    try {
+      return await this.isReviewDisabled(projectPath)
+    } catch (error_) {
+      transportLog(
+        `TaskRouter: isReviewDisabled resolver threw for ${projectPath} — defaulting to enabled: ${error_ instanceof Error ? error_.message : String(error_)}`,
+      )
+      return false
+    }
   }
 }

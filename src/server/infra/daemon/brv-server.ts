@@ -12,18 +12,20 @@
  * 1. Setup daemon logging
  * 2. Select port (random batch scan in dynamic range 49152-65535)
  * 3. Acquire global instance lock (atomic temp+rename)
- * 4. Start Socket.IO transport server
+ * 4. Construct Socket.IO transport server (start() is deferred — see step 11)
  * 5. Start heartbeat writer
  * 6. Install daemon resilience handlers
  * 7. Create services (auth, project state, agent pool, handlers)
  * 8. Wire events (idle timeout, auth broadcasts, state server)
  * 9. Create shutdown handler
  * 10. Start idle timer + register signal handlers
+ * 11. Start Socket.IO transport server (port opens — clients can connect)
  */
 
 import {GlobalInstanceManager} from '@campfirein/brv-transport-client'
 import express from 'express'
 import {fork, type StdioOptions} from 'node:child_process'
+import {randomUUID} from 'node:crypto'
 import {mkdirSync, readdirSync, readFileSync, unlinkSync} from 'node:fs'
 import {dirname, join} from 'node:path'
 import {fileURLToPath} from 'node:url'
@@ -37,17 +39,27 @@ import {
   AGENT_POOL_MAX_SIZE,
   BRV_DIR,
   HEARTBEAT_FILE,
+  WEBUI_DEFAULT_PORT,
 } from '../../constants.js'
-import {type ProviderConfigResponse, TransportStateEventNames} from '../../core/domain/transport/schemas.js'
+import {
+  type ProviderConfigResponse,
+  type TaskQueryResultEvent,
+  TransportStateEventNames,
+  TransportTaskEventNames,
+} from '../../core/domain/transport/schemas.js'
 import {getGlobalDataDir} from '../../utils/global-data-path.js'
 import {getProjectDataDir} from '../../utils/path-utils.js'
 import {crashLog, processLog} from '../../utils/process-logger.js'
 import {ClientManager} from '../client/client-manager.js'
 import {ProjectConfigStore} from '../config/file-config-store.js'
+import {readContextTreeRemoteUrl} from '../context-tree/read-context-tree-remote.js'
+import {DreamStateService} from '../dream/dream-state-service.js'
+import {DreamTrigger} from '../dream/dream-trigger.js'
 import {createReviewApiRouter} from '../http/review-api-handler.js'
 import {broadcastToProjectRoom} from '../process/broadcast-utils.js'
 import {CurateLogHandler} from '../process/curate-log-handler.js'
 import {setupFeatureHandlers} from '../process/feature-handlers.js'
+import {QueryLogHandler} from '../process/query-log-handler.js'
 import {TransportHandlers} from '../process/transport-handlers.js'
 import {ProjectRegistry} from '../project/project-registry.js'
 import {createProviderOAuthTokenStore} from '../provider-oauth/provider-oauth-token-store.js'
@@ -62,6 +74,14 @@ import {FileReviewBackupStore} from '../storage/file-review-backup-store.js'
 import {createProviderKeychainStore} from '../storage/provider-keychain-store.js'
 import {createTokenStore} from '../storage/token-store.js'
 import {SocketIOTransportServer} from '../transport/socket-io-transport-server.js'
+import {createWebUiMiddleware} from '../webui/webui-middleware.js'
+import {WebUiServer} from '../webui/webui-server.js'
+import {
+  readWebuiPreferredPort,
+  removeWebuiState,
+  writeWebuiPreferredPort,
+  writeWebuiState,
+} from '../webui/webui-state.js'
 import {AgentIdleTimeoutPolicy} from './agent-idle-timeout-policy.js'
 import {AgentPool} from './agent-pool.js'
 import {DaemonResilience} from './daemon-resilience.js'
@@ -172,11 +192,29 @@ async function main(): Promise<void> {
   let heartbeatWriter: HeartbeatWriter | undefined
   let authStateStore: AuthStateStore | undefined
   let agentPool: AgentPool | undefined
+  let webuiServer: undefined | WebUiServer
 
   try {
-    // 4. Start Socket.IO transport server (with Express for HTTP routes)
+    // 4a. Construct transport server. start() is deferred to step 11 so all handlers register before sockets connect.
     transportServer = new SocketIOTransportServer()
 
+    // 4b. Start Web UI server on stable port (separate from transport)
+    const daemonDir = dirname(fileURLToPath(import.meta.url))
+    const projectRoot = join(daemonDir, '..', '..', '..', '..')
+    const webuiDistDir = join(projectRoot, 'dist', 'webui')
+    // Port priority: env var > persisted preference > default
+    const webuiPortEnv = process.env.BRV_WEBUI_PORT
+    const webuiPort = webuiPortEnv
+      ? Number.parseInt(webuiPortEnv, 10)
+      : (readWebuiPreferredPort() ?? WEBUI_DEFAULT_PORT)
+
+    const webuiApp = createWebUiMiddleware({
+      getConfig: () => ({daemonPort: port, port: webuiPort, projectCwd: process.cwd(), version}),
+      webuiDistDir,
+    })
+
+    // Mount review API first so its responses are not subject to the
+    // web UI middleware's CSP (the review page uses inline scripts).
     const app = express()
     app.use(
       createReviewApiRouter({
@@ -184,12 +222,22 @@ async function main(): Promise<void> {
         reviewBackupStoreFactory: (projectPath) => new FileReviewBackupStore(join(projectPath, BRV_DIR)),
       }),
     )
-    transportServer.setHttpRequestHandler(app)
+    app.use(webuiApp)
 
-    await transportServer.start(port)
-    log(`Transport server started on port ${port}`)
+    webuiServer = new WebUiServer(app)
+    try {
+      await webuiServer.start(webuiPort)
+      writeWebuiState(webuiPort)
+      log(`Web UI server started on port ${webuiPort}`)
+    } catch (webuiError) {
+      log(
+        `Web UI port ${webuiPort} is already in use. Web UI will not be available. Set BRV_WEBUI_PORT=<port> to use a different port.`,
+      )
+      log(`Web UI start error: ${webuiError instanceof Error ? webuiError.message : String(webuiError)}`)
+      webuiServer = undefined
+    }
 
-    // 5. Start heartbeat writer
+    // 5. Start heartbeat writer. Must run before transport.start(): pollForDaemon SIGTERMs daemons with stale heartbeat.
     const heartbeatPath = join(getGlobalDataDir(), HEARTBEAT_FILE)
     heartbeatWriter = new HeartbeatWriter({
       filePath: heartbeatPath,
@@ -220,13 +268,40 @@ async function main(): Promise<void> {
       projectRegistry,
     })
 
+    // Shared queue-length resolver — used by both idle timeout policy and dream trigger
+    const getQueueLength = (projectPath: string): number =>
+      agentPool?.getQueueState().find((q) => q.projectPath === projectPath)?.queueLength ?? 0
+
+    // Shared project-config resolver — used by the idle-dream dispatch and the
+    // task-router resolver wired into TransportHandlers below. Both paths must
+    // stamp the same reviewDisabled value so review semantics are consistent
+    // regardless of dispatch source (CLI task:create vs idle trigger).
+    const curateConfigStore = new ProjectConfigStore()
+    const resolveReviewDisabled = async (projectPath: string): Promise<boolean> => {
+      const config = await curateConfigStore.read(projectPath)
+      return config?.reviewDisabled === true
+    }
+
+    // Shared dream pre-check trigger factory.
+    // The lock service explicitly throws if invoked — gate 4 (lock) is the agent's job;
+    // the daemon must only ever evaluate gates 1-3 via checkEligibility().
+    const makeDreamPreCheckTrigger = (projectPath: string): DreamTrigger =>
+      new DreamTrigger({
+        dreamLockService: {
+          tryAcquire() {
+            throw new Error('Lock must not be acquired during daemon eligibility pre-check')
+          },
+        },
+        dreamStateService: new DreamStateService({baseDir: join(projectPath, BRV_DIR)}),
+        getQueueLength,
+      })
+
     // Agent idle timeout policy — kills agents after period of inactivity
     const agentIdleTimeoutPolicy = new AgentIdleTimeoutPolicy({
       checkIntervalMs: AGENT_IDLE_CHECK_INTERVAL_MS,
-      getQueueLength: (projectPath: string) =>
-        agentPool?.getQueueState().find((q) => q.projectPath === projectPath)?.queueLength ?? 0,
+      getQueueLength,
       log,
-      onAgentIdle(projectPath: string, queueLength: number) {
+      async onAgentIdle(projectPath: string, queueLength: number) {
         // Don't kill agents that have queued tasks waiting
         if (queueLength > 0) {
           log(`Skipping idle cleanup: ${projectPath} has ${queueLength} queued tasks`)
@@ -240,7 +315,36 @@ async function main(): Promise<void> {
           return
         }
 
-        log(`Killing idle agent: ${projectPath}`)
+        // Check dream eligibility before killing (gates 1-3 only, no lock).
+        // Lock acquisition happens in the agent process when the dream task executes.
+        try {
+          const result = await makeDreamPreCheckTrigger(projectPath).checkEligibility(projectPath)
+          if (result.eligible) {
+            log(`Dream eligible, dispatching dream task: ${projectPath}`)
+            // Idle dispatch bypasses TaskRouter.handleTaskCreate, so the
+            // reviewDisabled snapshot that the task-router stamps for the CLI
+            // path must be reproduced inline here. Without it, idle dreams
+            // would always default to review-enabled regardless of project
+            // setting (see resolveReviewDisabled above).
+            const reviewDisabled = await resolveReviewDisabled(projectPath)
+            agentPool?.submitTask({
+              clientId: 'daemon',
+              content: 'Memory consolidation (idle trigger)',
+              force: false,
+              projectPath,
+              reviewDisabled,
+              taskId: randomUUID(),
+              trigger: 'agent-idle',
+              type: 'dream',
+            })
+            return
+          }
+
+          log(`Dream not eligible (${result.reason}), killing idle agent: ${projectPath}`)
+        } catch {
+          log(`Dream eligibility check failed, killing idle agent: ${projectPath}`)
+        }
+
         agentPool?.handleAgentDisconnected(projectPath)
       },
       timeoutMs: AGENT_IDLE_TIMEOUT_MS,
@@ -279,7 +383,8 @@ async function main(): Promise<void> {
 
     const curateLogHandler = new CurateLogHandler(undefined, (info) => {
       const encoded = Buffer.from(info.projectPath).toString('base64url')
-      const reviewUrl = `http://127.0.0.1:${port}/review?project=${encoded}`
+      const reviewPort = webuiServer?.getPort() ?? port
+      const reviewUrl = `http://127.0.0.1:${reviewPort}/review?project=${encoded}`
       const payload = {pendingCount: info.pendingCount, reviewUrl, taskId: info.taskId}
       // Send directly to the task originator (covers CLI clients not in the project room)
       transportServer!.sendTo(info.clientId, ReviewEvents.NOTIFY, payload)
@@ -294,15 +399,52 @@ async function main(): Promise<void> {
       )
     })
 
+    const queryLogHandler = new QueryLogHandler()
+
     const transportHandlers = new TransportHandlers({
       agentPool,
       clientManager,
-      lifecycleHooks: [curateLogHandler],
+      // Resolves the project's review-disabled flag once at task-create. The result
+      // is stamped onto TaskInfo + TaskExecute so daemon hooks (CurateLogHandler) and
+      // the agent process (curate-tool backups, dream review entries) all observe a
+      // single value across the daemon→agent process boundary. Shared with the
+      // idle-dream dispatch above so review semantics are identical regardless of
+      // dispatch source (CLI task:create vs agent-idle trigger).
+      isReviewDisabled: resolveReviewDisabled,
+      lifecycleHooks: [curateLogHandler, queryLogHandler],
+      // Daemon-side gate for dream task:create — mirrors the idle-trigger pre-check
+      // in this file so the CLI path (brv dream without --force) actually honors
+      // gate 3 (queue). The agent-side check kept gate 3 hardcoded to skip,
+      // which made the CLI ignore the spec when other tasks were queued.
+      async preDispatchCheck(task, projectPath) {
+        if (task.type !== 'dream' || task.force) return {eligible: true}
+        if (!projectPath) return {eligible: true}
+
+        try {
+          const result = await makeDreamPreCheckTrigger(projectPath).checkEligibility(projectPath)
+          return result.eligible ? {eligible: true} : {eligible: false, skipResult: `Dream skipped: ${result.reason}`}
+        } catch {
+          // Fail-open on pre-check errors: let the agent's own gate check be the fallback.
+          return {eligible: true}
+        }
+      },
       projectRegistry,
       projectRouter,
       transport: transportServer,
     })
     transportHandlers.setup()
+
+    // Wire query metadata from agent process → QueryLogHandler.
+    // Agent sends task:queryResult BEFORE task:completed (Socket.IO preserves order),
+    // so setQueryResult runs before onTaskCompleted merges the metadata.
+    transportServer.onRequest<TaskQueryResultEvent, void>(TransportTaskEventNames.QUERY_RESULT, (data) => {
+      queryLogHandler.setQueryResult(data.taskId, {
+        matchedDocs: data.matchedDocs,
+        searchMetadata: data.searchMetadata,
+        tier: data.tier,
+        timing: data.timing,
+      })
+    })
 
     // 8. Create idle timeout policy + shutdown handler
     //    (must be created before wiring closures that reference them)
@@ -333,6 +475,7 @@ async function main(): Promise<void> {
       instanceManager,
       log,
       transportServer,
+      webuiServer,
     })
 
     // 10. Wire events (state server, idle timeout)
@@ -356,7 +499,7 @@ async function main(): Promise<void> {
     // State server endpoints — agent child processes request config on startup
     transportServer.onRequest<
       {projectPath: string},
-      {brvConfig?: BrvConfig; spaceId: string; storagePath: string; teamId: string}
+      {brvConfig?: BrvConfig; remoteUrl?: string; spaceId: string; storagePath: string; teamId: string}
     >(TransportStateEventNames.GET_PROJECT_CONFIG, async (data) => {
       // Smart invalidation: only invalidate if config file was modified since last load
       // This prevents unnecessary disk I/O while still catching changes from
@@ -367,11 +510,15 @@ async function main(): Promise<void> {
         log(`Config invalidated due to file modification: ${data.projectPath}`)
       }
 
-      const config = await projectStateLoader.getProjectConfig(data.projectPath)
+      const [config, remoteUrl] = await Promise.all([
+        projectStateLoader.getProjectConfig(data.projectPath),
+        readContextTreeRemoteUrl(data.projectPath),
+      ])
       // Register project (idempotent) to ensure XDG storage directories exist
       const projectInfo = projectRegistry.register(data.projectPath)
       return {
         brvConfig: config,
+        remoteUrl,
         spaceId: config?.spaceId ?? '',
         storagePath: projectInfo.storagePath,
         teamId: config?.teamId ?? '',
@@ -394,6 +541,45 @@ async function main(): Promise<void> {
     transportServer.onRequest<void, {success: boolean}>('auth:reload', async () => {
       await authStateStore!.loadToken()
       return {success: true}
+    })
+
+    // Web UI port endpoint — used by `brv webui` to discover the stable port
+    transportServer.onRequest<void, {port?: number}>('webui:getPort', () => ({
+      port: webuiServer?.getPort(),
+    }))
+
+    // Web UI set port — restarts webui server on new port and persists preference
+    transportServer.onRequest<{port: number}, {port: number; success: boolean}>('webui:setPort', async (data) => {
+      const newPort = data.port
+
+      // Stop existing webui server if running
+      if (webuiServer?.isRunning()) {
+        await webuiServer.stop()
+        log(`Stopped web UI server on port ${webuiServer.getPort() ?? '?'}`)
+      }
+
+      // Create fresh Express app for the new server
+      const newWebuiApp = createWebUiMiddleware({
+        getConfig: () => ({daemonPort: port, port: newPort, projectCwd: process.cwd(), version}),
+        webuiDistDir,
+      })
+      const newApp = express()
+      newApp.use(
+        createReviewApiRouter({
+          curateLogStoreFactory: (projectPath) => new FileCurateLogStore({baseDir: getProjectDataDir(projectPath)}),
+          reviewBackupStoreFactory: (projectPath) => new FileReviewBackupStore(join(projectPath, BRV_DIR)),
+        }),
+      )
+      newApp.use(newWebuiApp)
+
+      // Start on new port
+      webuiServer = new WebUiServer(newApp)
+      await webuiServer.start(newPort)
+      writeWebuiState(newPort)
+      writeWebuiPreferredPort(newPort)
+      log(`Web UI server restarted on port ${newPort} (persisted)`)
+
+      return {port: newPort, success: true}
     })
 
     // Debug endpoint — exposes daemon internal state for `brv debug` command
@@ -468,6 +654,7 @@ async function main(): Promise<void> {
       providerOAuthTokenStore,
       resolveProjectPath: (clientId) => clientManager.getClient(clientId)?.projectPath,
       transport: transportServer,
+      webuiPort: webuiServer?.getPort(),
     })
 
     // Load auth token AFTER feature handlers are registered.
@@ -493,6 +680,10 @@ async function main(): Promise<void> {
       })
     })
 
+    // 11. All handlers registered — open the socket port now.
+    await transportServer.start(port)
+    log(`Transport server started on port ${port}`)
+
     log(`Daemon fully started (PID: ${process.pid}, port: ${port})`)
   } catch (error: unknown) {
     // Best-effort cleanup of anything started before the failure.
@@ -503,6 +694,8 @@ async function main(): Promise<void> {
 
     authStateStore?.stopPolling()
     heartbeatWriter?.stop()
+    await webuiServer?.stop().catch(() => {})
+    removeWebuiState()
     await transportServer?.stop().catch(() => {})
     instanceManager.release()
     throw error

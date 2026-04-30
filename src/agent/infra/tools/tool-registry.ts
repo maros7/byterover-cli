@@ -1,3 +1,4 @@
+import type { IRuntimeSignalStore } from '../../../server/core/interfaces/storage/i-runtime-signal-store.js'
 import type { EnvironmentContext } from '../../core/domain/environment/types.js'
 import type { KnownTool } from '../../core/domain/tools/constants.js'
 import type { Tool } from '../../core/domain/tools/types.js'
@@ -7,6 +8,7 @@ import type { IFileSystem } from '../../core/interfaces/i-file-system.js'
 import type { ILogger } from '../../core/interfaces/i-logger.js'
 import type { IProcessService } from '../../core/interfaces/i-process-service.js'
 import type { ISandboxService } from '../../core/interfaces/i-sandbox-service.js'
+import type { ISwarmCoordinator } from '../../core/interfaces/i-swarm-coordinator.js'
 import type { ITodoStorage } from '../../core/interfaces/i-todo-storage.js'
 import type { ITokenizer } from '../../core/interfaces/i-tokenizer.js'
 import type { AbstractGenerationQueue } from '../map/abstract-queue.js'
@@ -27,6 +29,8 @@ import { createLlmMapTool } from './implementations/llm-map-tool.js'
 import { createReadFileTool } from './implementations/read-file-tool.js'
 import { createSearchKnowledgeService } from './implementations/search-knowledge-service.js'
 import { createSearchKnowledgeTool } from './implementations/search-knowledge-tool.js'
+import { createSwarmQueryTool } from './implementations/swarm-query-tool.js'
+import { createSwarmStoreTool } from './implementations/swarm-store-tool.js'
 import { createWriteFileTool } from './implementations/write-file-tool.js'
 import { ToolMarker } from './tool-markers.js'
 
@@ -68,8 +72,18 @@ export interface ToolServices {
   /** Process service for command execution */
   processService?: IProcessService
 
+  /**
+   * Sidecar store for per-machine ranking signals. When provided, curate and
+   * search tools mirror their scoring writes here alongside the markdown
+   * writes. Phase 3 of the runtime-signals migration.
+   */
+  runtimeSignalStore?: IRuntimeSignalStore
+
   /** Sandbox service for code execution */
   sandboxService?: ISandboxService
+
+  /** Swarm coordinator for cross-provider memory queries */
+  swarmCoordinator?: ISwarmCoordinator
 
   /** Todo storage service for session-based todo persistence */
   todoStorage?: ITodoStorage
@@ -160,7 +174,7 @@ export const TOOL_REGISTRY: Record<KnownTool, ToolRegistryEntry> = {
 
   [ToolName.CODE_EXEC]: {
     descriptionFile: 'code_exec',
-    factory({ abstractQueue, environmentContext, fileSystemService, sandboxService }) {
+    factory({ abstractQueue, environmentContext, fileSystemService, runtimeSignalStore, sandboxService, swarmCoordinator }) {
       const sandbox = getRequiredService(sandboxService, 'sandboxService')
 
       // Inject file system service into sandbox for Tools SDK
@@ -170,19 +184,30 @@ export const TOOL_REGISTRY: Record<KnownTool, ToolRegistryEntry> = {
 
       // Inject search knowledge service into sandbox for Tools SDK
       if (fileSystemService && sandbox.setSearchKnowledgeService) {
-        const searchKnowledgeService = createSearchKnowledgeService(fileSystemService)
+        const searchKnowledgeService = createSearchKnowledgeService(fileSystemService, {
+          runtimeSignalStore,
+        })
         sandbox.setSearchKnowledgeService(searchKnowledgeService)
       }
 
       // Inject curate service into sandbox for Tools SDK
       if (sandbox.setCurateService) {
-        const curateService = createCurateService(environmentContext?.workingDirectory, abstractQueue)
+        const curateService = createCurateService(
+          environmentContext?.workingDirectory,
+          abstractQueue,
+          runtimeSignalStore,
+        )
         sandbox.setCurateService(curateService)
       }
 
       // Inject environment context into sandbox for env.* access
       if (environmentContext && sandbox.setEnvironmentContext) {
         sandbox.setEnvironmentContext(environmentContext)
+      }
+
+      // Inject swarm coordinator into sandbox for tools.swarmQuery/swarmStore
+      if (swarmCoordinator && sandbox.setSwarmCoordinator) {
+        sandbox.setSwarmCoordinator(swarmCoordinator)
       }
 
       return createCodeExecTool(sandbox)
@@ -193,8 +218,8 @@ export const TOOL_REGISTRY: Record<KnownTool, ToolRegistryEntry> = {
 
   [ToolName.CURATE]: {
     descriptionFile: 'curate',
-    factory: ({ abstractQueue, environmentContext }) =>
-      createCurateTool(environmentContext?.workingDirectory, abstractQueue),
+    factory: ({ abstractQueue, environmentContext, logger, runtimeSignalStore }) =>
+      createCurateTool(environmentContext?.workingDirectory, abstractQueue, runtimeSignalStore, logger),
     markers: [ToolMarker.ContextBuilding, ToolMarker.Modification],
     outputGuidance: 'curate',
     requiredServices: [],
@@ -202,8 +227,11 @@ export const TOOL_REGISTRY: Record<KnownTool, ToolRegistryEntry> = {
 
   [ToolName.EXPAND_KNOWLEDGE]: {
     descriptionFile: 'expand_knowledge',
-    factory: ({ environmentContext }) =>
-      createExpandKnowledgeTool({ baseDirectory: environmentContext?.workingDirectory }),
+    factory: ({ environmentContext, runtimeSignalStore }) =>
+      createExpandKnowledgeTool({
+        baseDirectory: environmentContext?.workingDirectory,
+        runtimeSignalStore,
+      }),
     markers: [ToolMarker.Discovery],
     requiredServices: [],
   },
@@ -263,9 +291,33 @@ export const TOOL_REGISTRY: Record<KnownTool, ToolRegistryEntry> = {
   [ToolName.SEARCH_KNOWLEDGE]: {
     descriptionFile: 'search_knowledge',
     factory: (services) =>
-      createSearchKnowledgeTool(getRequiredService(services.fileSystemService, 'fileSystemService')),
+      createSearchKnowledgeTool(getRequiredService(services.fileSystemService, 'fileSystemService'), {
+        runtimeSignalStore: services.runtimeSignalStore,
+      }),
     markers: [ToolMarker.ContextBuilding, ToolMarker.Discovery],
     requiredServices: ['fileSystemService'],
+  },
+
+  [ToolName.SWARM_QUERY]: {
+    descriptionFile: 'swarm_query',
+    factory(services) {
+      const coordinator = getRequiredService(services.swarmCoordinator, 'swarmCoordinator')
+
+      return createSwarmQueryTool(coordinator)
+    },
+    markers: [ToolMarker.Discovery],
+    requiredServices: ['swarmCoordinator'],
+  },
+
+  [ToolName.SWARM_STORE]: {
+    descriptionFile: 'swarm_store',
+    factory(services) {
+      const coordinator = getRequiredService(services.swarmCoordinator, 'swarmCoordinator')
+
+      return createSwarmStoreTool(coordinator)
+    },
+    markers: [ToolMarker.Modification],
+    requiredServices: ['swarmCoordinator'],
   },
 
   [ToolName.WRITE_FILE]: {

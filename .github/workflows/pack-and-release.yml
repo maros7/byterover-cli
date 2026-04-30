@@ -21,6 +21,8 @@ jobs:
         include:
           - os: macos-latest
             target: darwin-arm64
+          - os: macos-15-intel
+            target: darwin-x64
           - os: ubuntu-latest
             target: linux-x64
           - os: ubuntu-24.04-arm
@@ -40,6 +42,9 @@ jobs:
             echo "::error::Tag version ($TAG_VERSION) does not match package.json version ($PKG_VERSION)"
             exit 1
           fi
+      - uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.BYTEROVER_WEB_PACKAGES_DEPLOY_KEY }}
       - run: npm ci
       - name: Create .env.production
         run: echo "$ENV_PRODUCTION" > .env.production
@@ -104,7 +109,7 @@ jobs:
           SHA="${{ steps.meta.outputs.sha }}"
           GCS_VERSIONED="gs://${GCS_BUCKET}/versions/${VERSION}/${SHA}"
           GCS_CHANNEL="gs://${GCS_BUCKET}/channels/stable"
-          for target in darwin-arm64 linux-x64 linux-arm64; do
+          for target in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
             versioned_tarball="brv-v${VERSION}-${SHA}-${target}.tar.gz"
             channel_tarball="brv-${target}.tar.gz"
             echo "Promoting ${versioned_tarball} -> ${channel_tarball}"

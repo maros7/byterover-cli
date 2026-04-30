@@ -22,20 +22,25 @@
 import {connectToTransport, type ITransportClient} from '@campfirein/brv-transport-client'
 import {randomUUID} from 'node:crypto'
 import {appendFileSync} from 'node:fs'
+import {join} from 'node:path'
 
+import type {ISearchKnowledgeService} from '../../../agent/infra/sandbox/tools-sdk.js'
 import type {BrvConfig} from '../../core/domain/entities/brv-config.js'
 import type {ProviderConfigResponse, TaskExecute} from '../../core/domain/transport/schemas.js'
+import type {IRuntimeSignalStore} from '../../core/interfaces/storage/i-runtime-signal-store.js'
 
 import {SESSIONS_DIR} from '../../../agent/core/domain/session/session-metadata.js'
 import {CipherAgent} from '../../../agent/infra/agent/index.js'
 import {FileSystemService} from '../../../agent/infra/file-system/file-system-service.js'
 import {FolderPackService} from '../../../agent/infra/folder-pack/folder-pack-service.js'
 import {SessionMetadataStore} from '../../../agent/infra/session/session-metadata-store.js'
+import {FileKeyStorage} from '../../../agent/infra/storage/file-key-storage.js'
+import {runWithReviewDisabled} from '../../../agent/infra/tools/implementations/curate-tool-task-context.js'
 import {createSearchKnowledgeService} from '../../../agent/infra/tools/implementations/search-knowledge-service.js'
 import {AuthEvents} from '../../../shared/transport/events/auth-events.js'
 import {decodeSearchContent} from '../../../shared/transport/search-content.js'
 import {getCurrentConfig} from '../../config/environment.js'
-import {DEFAULT_LLM_MODEL, PROJECT} from '../../constants.js'
+import {BRV_DIR, DEFAULT_LLM_MODEL, PROJECT} from '../../constants.js'
 import {serializeTaskError, TaskError, TaskErrorCode} from '../../core/domain/errors/task-error.js'
 import {loadSources} from '../../core/domain/source/source-schema.js'
 import {
@@ -44,12 +49,22 @@ import {
   TransportStateEventNames,
   TransportTaskEventNames,
 } from '../../core/domain/transport/schemas.js'
+import {FileContextTreeArchiveService} from '../context-tree/file-context-tree-archive-service.js'
+import {RuntimeSignalStore} from '../context-tree/runtime-signal-store.js'
+import {DreamLockService} from '../dream/dream-lock-service.js'
+import {DreamLogStore} from '../dream/dream-log-store.js'
+import {DreamStateService} from '../dream/dream-state-service.js'
+import {DreamTrigger} from '../dream/dream-trigger.js'
 import {CurateExecutor} from '../executor/curate-executor.js'
+import {DreamExecutor} from '../executor/dream-executor.js'
 import {FolderPackExecutor} from '../executor/folder-pack-executor.js'
 import {QueryExecutor} from '../executor/query-executor.js'
 import {SearchExecutor} from '../executor/search-executor.js'
+import {FileCurateLogStore} from '../storage/file-curate-log-store.js'
+import {FileReviewBackupStore} from '../storage/file-review-backup-store.js'
 import {AgentInstanceDiscovery} from '../transport/agent-instance-discovery.js'
 import {createAgentLogger} from './agent-logger.js'
+import {PostWorkRegistry} from './post-work-registry.js'
 import {resolveSessionId} from './session-resolver.js'
 import {validateProviderForTask} from './task-validation.js'
 
@@ -82,6 +97,16 @@ const port = portEnv
 const projectPath = projectPathEnv
 
 const agentLog = createAgentLogger(process.env.BRV_SESSION_LOG, `[agent-process:${projectPath}]`)
+
+/**
+ * Holds detached post-curate work so `task:completed` can fire as soon as
+ * the agent body finishes. Drained on shutdown to avoid truncated writes.
+ */
+const postWorkRegistry = new PostWorkRegistry({
+  onError(_projectPath, error) {
+    agentLog(`post-work error: ${error instanceof Error ? error.message : String(error)}`)
+  },
+})
 
 /**
  * Persist a brand-new session's metadata and set it as active.
@@ -248,7 +273,7 @@ async function start(): Promise<void> {
 
   const envConfig = getCurrentConfig()
   const agentConfig = {
-    apiBaseUrl: envConfig.llmApiBaseUrl,
+    apiBaseUrl: envConfig.llmBaseUrl,
     fileSystem: {allowedPaths: ['.', ...sharedAllowedPaths], workingDirectory: projectPath},
     llm: {
       maxIterations: 10,
@@ -354,7 +379,27 @@ async function start(): Promise<void> {
     workingDirectory: projectPath,
   })
   await fileSystemService.initialize()
-  const searchService = createSearchKnowledgeService(fileSystemService, {baseDirectory: projectPath})
+
+  // Runtime-signal sidecar for this daemon. FileKeyStorage is file-backed
+  // under configResult.storagePath, so the daemon and any other process for
+  // the same project write to the same on-disk store. `brv search`, curate,
+  // and archive in this daemon all mirror scoring writes through it.
+  const daemonKeyStorage = new FileKeyStorage({
+    storageDir: configResult.storagePath,
+  })
+  await daemonKeyStorage.initialize()
+  const daemonLogger = {
+    debug: (msg: string): void => agentLog(msg),
+    error: (msg: string): void => agentLog(msg),
+    info: (msg: string): void => agentLog(msg),
+    warn: (msg: string): void => agentLog(msg),
+  }
+  const daemonRuntimeSignalStore = new RuntimeSignalStore(daemonKeyStorage, daemonLogger)
+
+  const searchService = createSearchKnowledgeService(fileSystemService, {
+    baseDirectory: projectPath,
+    runtimeSignalStore: daemonRuntimeSignalStore,
+  })
 
   // 7. Create executors and listen for task:execute from pool
   const curateExecutor = new CurateExecutor()
@@ -372,7 +417,16 @@ async function start(): Promise<void> {
   transport.on<TaskExecute>(TransportTaskEventNames.EXECUTE, (task) => {
     agentLog(`task:execute received taskId=${task.taskId} type=${task.type} activeTaskCount=${activeTaskCount + 1}`)
     // eslint-disable-next-line no-void
-    void executeTask(task, curateExecutor, folderPackExecutor, queryExecutor, searchExecutor)
+    void executeTask(
+      task,
+      curateExecutor,
+      folderPackExecutor,
+      queryExecutor,
+      searchExecutor,
+      searchService,
+      configResult.storagePath,
+      daemonRuntimeSignalStore,
+    )
   })
 
   // 8. Register with transport server (for TransportHandlers tracking)
@@ -389,8 +443,11 @@ async function executeTask(
   folderPackExecutor: FolderPackExecutor,
   queryExecutor: QueryExecutor,
   searchExecutor: SearchExecutor,
+  searchKnowledgeService: ISearchKnowledgeService,
+  storagePath: string,
+  runtimeSignalStore: IRuntimeSignalStore,
 ): Promise<void> {
-  const {clientCwd, clientId, content, files, folderPath, taskId, type, worktreeRoot} = task
+  const {clientCwd, clientId, content, files, folderPath, force, reviewDisabled, taskId, trigger, type, worktreeRoot} = task
   if (!transport || !agent) return
 
   // Search tasks are pure BM25 retrieval — no LLM, no provider needed.
@@ -408,7 +465,19 @@ async function executeTask(
 
   activeTaskCount++
 
-  try {
+  // Body of the task — extracted so the daemon-stamped reviewDisabled snapshot can be
+  // opened as an AsyncLocalStorage scope around it. Tools that run inside this task
+  // (curate-tool.executeCurate, including the sandbox `tools.curate(...)` path via
+  // CurateService where _context.taskId is not threaded through) read the snapshot
+  // from the ALS scope instead of re-reading .brv/config.json — that read can race
+  // with mid-task user toggles, which is exactly the inconsistency we are eliminating.
+  // We only open the scope when the daemon stamped a value; otherwise consumers fall
+  // back to the file read, preserving behavior for legacy clients without a stamp.
+  const runTaskBody = async (): Promise<void> => {
+    // Re-narrow inside the closure: TypeScript loses the function-scope narrowing
+    // from the early-return guard above once we hand control to a callback.
+    if (!transport || !agent) return
+
     // Only refresh config and hot-swap provider when this is the first concurrent task.
     // Subsequent concurrent tasks reuse cached config to avoid race conditions
     // on provider hot-swap (which replaces SessionManager).
@@ -466,17 +535,39 @@ async function executeTask(
       // Socket dropped — continue executing so we can still emit task:completed/error when socket reconnects
     }
 
+    // Block new tree-writers until any detached Phase 4 from a prior task
+    // on this project drains. `query` / `search` are intentionally NOT
+    // gated — they read the manifest and tolerate a stale snapshot via
+    // `readManifestIfFresh` + rebuild fallback, so blocking them would
+    // be a needless latency hit.
+    if (type === 'curate' || type === 'curate-folder' || type === 'dream') {
+      await postWorkRegistry.awaitProject(projectPath)
+    }
+
     try {
       let result: string
+      let logId: string | undefined
+      // Captured during curate / curate-folder; submitted to the registry
+      // after `task:completed` so the user does not wait on Phase 4.
+      let postWork: (() => Promise<void>) | undefined
       switch (type) {
         case 'curate': {
-          result = await curateExecutor.executeWithAgent(agent, {clientCwd, content, files, projectRoot: projectPath, taskId, worktreeRoot})
+          const curateResult = await curateExecutor.runAgentBody(agent, {
+            clientCwd,
+            content,
+            files,
+            projectRoot: projectPath,
+            taskId,
+            worktreeRoot,
+          })
+          result = curateResult.response
+          postWork = curateResult.finalize
 
           break
         }
 
         case 'curate-folder': {
-          result = await folderPackExecutor.executeWithAgent(agent, {
+          const folderResult = await folderPackExecutor.runAgentBody(agent, {
             clientCwd,
             content,
             folderPath: folderPath!,
@@ -484,12 +575,73 @@ async function executeTask(
             taskId,
             worktreeRoot,
           })
+          result = folderResult.response
+          postWork = folderResult.finalize
+
+          break
+        }
+
+        case 'dream': {
+          const brvDir = join(projectPath, BRV_DIR)
+          const dreamLockService = new DreamLockService({baseDir: brvDir})
+          const dreamStateService = new DreamStateService({baseDir: brvDir})
+
+          // Run trigger check (acquires lock if eligible).
+          // Gate 3 (queue) is pre-checked by the daemon (TransportHandlers.preDispatchCheck
+          // for CLI dispatch, onAgentIdle for idle-trigger dispatch), so the agent treats
+          // its own queue view as empty. Gates 1 (time) and 2 (activity) are re-checked here
+          // as defense-in-depth in case state drifted between dispatch and execution.
+          const dreamTrigger = new DreamTrigger({
+            dreamLockService,
+            dreamStateService,
+            getQueueLength: () => 0,
+          })
+          const eligibility = await dreamTrigger.tryStartDream(projectPath, force)
+          if (!eligibility.eligible) {
+            result = `Dream skipped: ${eligibility.reason}`
+            break
+          }
+
+          const dreamExecutor = new DreamExecutor({
+            archiveService: new FileContextTreeArchiveService(runtimeSignalStore),
+            curateLogStore: new FileCurateLogStore({baseDir: storagePath}),
+            dreamLockService,
+            dreamLogStore: new DreamLogStore({baseDir: brvDir}),
+            dreamStateService,
+            reviewBackupStore: new FileReviewBackupStore(brvDir),
+            runtimeSignalStore,
+            searchService: searchKnowledgeService,
+          })
+          const dreamResult = await dreamExecutor.executeWithAgent(agent, {
+            priorMtime: eligibility.priorMtime,
+            projectRoot: projectPath,
+            ...(reviewDisabled === undefined ? {} : {reviewDisabled}),
+            taskId,
+            trigger: trigger ?? 'cli',
+          })
+          result = dreamResult.result
+          logId = dreamResult.logId
 
           break
         }
 
         case 'query': {
-          result = await queryExecutor.executeWithAgent(agent, {query: content, taskId, worktreeRoot})
+          const queryResult = await queryExecutor.executeWithAgent(agent, {query: content, taskId, worktreeRoot})
+          result = queryResult.response
+
+          // Send query metadata to daemon for QueryLogHandler (crosses process boundary via transport).
+          // Must arrive BEFORE task:completed so setQueryResult runs before onTaskCompleted.
+          try {
+            transport.request(TransportTaskEventNames.QUERY_RESULT, {
+              matchedDocs: queryResult.matchedDocs,
+              searchMetadata: queryResult.searchMetadata,
+              taskId,
+              tier: queryResult.tier,
+              timing: queryResult.timing,
+            })
+          } catch {
+            agentLog(`task:queryResult send failed taskId=${taskId}`)
+          }
 
           break
         }
@@ -503,21 +655,29 @@ async function executeTask(
         }
       }
 
-      // Emit task:completed
+      // Emit task:completed BEFORE the detached Phase 4 so the user sees
+      // the response as soon as the agent body finishes.
       agentLog(`task:completed taskId=${taskId}`)
       try {
-        transport.request(TransportTaskEventNames.COMPLETED, {clientId, result, taskId})
+        transport.request(TransportTaskEventNames.COMPLETED, {clientId, ...(logId ? {logId} : {}), projectPath, result, taskId})
       } catch (error) {
         agentLog(
           `task:completed send failed taskId=${taskId}: ${error instanceof Error ? error.message : String(error)}`,
         )
+      }
+
+      // Submit detached post-curate work to the registry. Mutex'd per project
+      // and drained on shutdown so SIGTERM mid-work cannot truncate `_index.md`.
+      if (postWork) {
+        agentLog(`post-work queued taskId=${taskId}`)
+        postWorkRegistry.submit(projectPath, postWork)
       }
     } catch (error) {
       // Emit task:error
       const errorData = serializeTaskError(error)
       agentLog(`task:error taskId=${taskId} error=${errorData.message}`)
       try {
-        transport.request(TransportTaskEventNames.ERROR, {clientId, error: errorData, taskId})
+        transport.request(TransportTaskEventNames.ERROR, {clientId, error: errorData, projectPath, taskId})
       } catch (error_) {
         agentLog(
           `task:error send failed taskId=${taskId}: ${error_ instanceof Error ? error_.message : String(error_)}`,
@@ -526,15 +686,30 @@ async function executeTask(
     } finally {
       cleanupForwarding?.()
     }
+  }
+
+  try {
+    await (reviewDisabled === undefined ? runTaskBody() : runWithReviewDisabled(reviewDisabled, runTaskBody))
   } finally {
     activeTaskCount--
 
-    // Deferred hot-swap: if provider changed while tasks were in-flight,
-    // trigger swap now that all tasks are done
+    // Deferred hot-swap when provider changed mid-task. Wait on detached
+    // Phase 4 first — rebuilding SessionManager during an in-flight
+    // `propagateStaleness` LLM call would silently corrupt Phase 4.
+    // Reserve the swap slot synchronously by clearing the dirty flag now;
+    // a task arriving during the awaitAll wait then sees a clean flag and
+    // skips its inline swap, so only the deferred chain runs hotSwap.
     if (activeTaskCount === 0 && providerConfigDirty && agent && transport) {
-      hotSwapProvider(agent, transport).catch((error) => {
-        agentLog(`deferred hotSwapProvider failed: ${error instanceof Error ? error.message : String(error)}`)
-      })
+      providerConfigDirty = false
+      const swapAgent = agent
+      const swapTransport = transport
+      postWorkRegistry
+        .awaitAll()
+        .then(() => hotSwapProvider(swapAgent, swapTransport))
+        .catch((error: unknown) => {
+          providerConfigDirty = true
+          agentLog(`deferred hotSwapProvider failed: ${error instanceof Error ? error.message : String(error)}`)
+        })
     }
   }
 }
@@ -689,6 +864,18 @@ async function hotSwapProvider(
 
 async function shutdown(): Promise<void> {
   agentLog('Shutting down...')
+
+  // Drain detached Phase 4 BEFORE stopping the agent — `propagateStaleness`
+  // mid-write would otherwise leave `_index.md` truncated on SIGTERM.
+  try {
+    const drainStart = Date.now()
+    const drainResult = await postWorkRegistry.drain(30_000)
+    agentLog(
+      `post-work drain (${Date.now() - drainStart}ms): drained=${drainResult.drained} abandoned=${drainResult.abandoned}`,
+    )
+  } catch (error) {
+    agentLog(`post-work drain failed: ${error instanceof Error ? error.message : String(error)}`)
+  }
 
   try {
     if (agent) {

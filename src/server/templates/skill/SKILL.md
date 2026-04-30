@@ -77,27 +77,37 @@ brv curate "Auth uses JWT with 24h expiry. Tokens stored in httpOnly cookies via
 brv curate "Authentication middleware details" -f src/middleware/auth.ts
 ```
 
-**View curate history:** to check past curations
-- Show recent entries (last 10)
+**Execution mode: wait by default**
+
+Default is **blocking** — call `brv curate "..."` with no flag and wait for it to finish before continuing. Any follow-up step (query, search, read, review, next curate that builds on this one) may depend on the just-curated data being live in the context tree.
+
 ```bash
-brv curate view
+brv curate "..."                 # DEFAULT — wait until done, then continue
+brv curate "..." --detach        # Only when BOTH conditions below hold
 ```
-- Full detail for a specific entry: all files and operations performed (logId is printed by `brv curate` on completion, e.g. `cur-1739700001000`)
+
+**Use `--detach` only when BOTH of the following are true:**
+
+1. No remaining step in this turn will query, search, read, or reference this curated data, AND no later curate in this turn builds on it.
+2. The user explicitly said not to wait — phrases addressed *to you* like "don't wait", "don't block on this", "fire and forget", "move on without waiting". The phrase must be something the user says to the agent, not something the agent would narrate about itself. This rules out "run in background" and "run async" as triggers — agents use those phrases to self-narrate at least as often as users use them to instruct, which creates a mirror-priming loop.
+
+**If the user's phrasing is ambiguous, wait.** Detach requires an unambiguous signal. "Quick one, keep moving" is not enough.
+
+If either condition is uncertain, do not `--detach`. Wait.
+
+**Size/duration is NOT a reason to `--detach`.** A slow curate whose output the next step reads must still block. **"Looks like the last step" is also NOT a reason** — that is a guess, not evidence.
+
+**Reporting:**
+- Blocking (default) → "Saved X"
+- `--detach` → "Queued X (log: `<logId>`)" — do NOT claim "saved" until verified
+
+**Cross-turn hygiene for detached curates (CRITICAL):** before any later tool call reads data a previous `--detach` submitted, run:
+
 ```bash
-brv curate view cur-1739700001000
+brv curate view <logId> --format json
 ```
-- List entries with file operations visible (no logId needed)
-```bash
-brv curate view detail
-```
-- Filter by time and status
-```bash
-brv curate view --since 1h --status completed
-```
-- For all filter options
-```bash
-brv curate view --help
-```
+
+Only proceed when `status: completed`. If `processing`, wait or tell the user. If `error`/`cancelled`, report and consider re-curate. `--detach` errors are silent — verification before trust is mandatory.
 
 ### 4. Review Pending Changes
 **Overview:** After a curate operation, some changes may require human review before being applied. Use `brv review` to list, approve, or reject pending operations.
@@ -308,6 +318,248 @@ brv vc push -u origin main       # push and set upstream tracking
 **Clone a space:**
 ```bash
 brv vc clone https://byterover.dev/<team>/<space>.git
+```
+
+### 8. Swarm Query
+**Overview:** Search across all active memory providers simultaneously — ByteRover context tree, Obsidian vault, Local Markdown folders, GBrain, and Memory Wiki. Results are fused via Reciprocal Rank Fusion (RRF) and ranked by provider weight and relevance. No LLM call — pure algorithmic search.
+
+**Use this skill when:**
+- You need to search across multiple knowledge sources at once
+- The user has configured multiple memory providers (check with `brv swarm status`)
+- You want results from Obsidian notes, GBrain entities, or wiki pages alongside ByteRover context
+
+**Do NOT use this skill when:**
+- The user only has ByteRover configured — use `brv query` instead (it synthesizes via LLM)
+- You need an LLM-synthesized answer — `brv swarm query` returns raw search results, not synthesized text
+
+```bash
+brv swarm query "How does JWT refresh work?"
+```
+
+Output:
+```
+Swarm Query: "How does JWT refresh work?"
+Type: factual | Providers: 4 queried | Latency: 398ms
+──────────────────────────────────────────────────
+1. [memory-wiki] sources/jwt-token-lifecycle.md    score: 0.0150  [keyword]
+   # JWT Token Lifecycle ...
+2. [obsidian] SwarmTestData/Authentication System.md    score: 0.0142  [keyword]
+   # Authentication System ...
+3. [gbrain] alex-chen    score: 0.0117  [semantic]
+   # Alex Chen — Senior Backend Engineer ...
+```
+
+**With explain mode** (shows classification, provider selection, enrichment):
+```bash
+brv swarm query "authentication patterns" --explain
+```
+
+Output:
+```
+Classification: factual
+Provider selection: 4 of 4 available
+  ✓ byterover    (healthy, selected, 0 results, 14ms)
+  ✓ obsidian    (healthy, selected, 5 results, 91ms)
+  ✓ memory-wiki    (healthy, selected, 2 results, 15ms)
+  ✓ gbrain    (healthy, selected, 1 results, 260ms)
+Enrichment:
+  byterover → obsidian
+  byterover → memory-wiki
+Results: 8 raw → 7 after RRF fusion + precision filtering
+```
+
+**JSON output:**
+```bash
+brv swarm query "rate limiting" --format json
+```
+
+Output:
+```json
+{
+  "meta": {
+    "queryType": "factual",
+    "totalLatencyMs": 340,
+    "providers": {
+      "byterover": { "selected": true, "resultCount": 0 },
+      "obsidian": { "selected": true, "resultCount": 5 },
+      "gbrain": { "selected": true, "resultCount": 1 },
+      "memory-wiki": { "selected": true, "resultCount": 1 }
+    }
+  },
+  "results": [
+    { "provider": "memory-wiki", "providerType": "memory-wiki", "score": 0.015, "content": "# Rate Limiting ..." }
+  ]
+}
+```
+
+**Limit results:**
+```bash
+brv swarm query "testing strategy" -n 5
+```
+
+**Flags:** `--explain` (show routing details), `--format json` (structured output), `-n <value>` (max results).
+
+### 9. Swarm Curate
+**Overview:** Store knowledge in the best available external memory provider. ByteRover automatically classifies the content type and routes accordingly: entities (people, orgs) go to GBrain, notes (meeting notes, TODOs) go to Local Markdown, general content goes to the first writable provider. Falls back to ByteRover context tree if no external providers are available.
+
+**Use this skill when:**
+- You want to store knowledge in an external provider (GBrain, Local Markdown, Memory Wiki)
+- The user has configured writable swarm providers
+
+**Do NOT use this skill when:**
+- You want to store in ByteRover's context tree specifically — use `brv curate` instead
+- No swarm providers are configured — use `brv curate` instead
+
+```bash
+brv swarm curate "Jane Smith is the CTO of TechCorp"
+```
+
+Output:
+```
+Stored to gbrain as concept/jane-smith-cto
+```
+
+**Target a specific provider:**
+```bash
+brv swarm curate "meeting notes: decided on JWT" --provider local-markdown:notes
+```
+
+Output:
+```
+Stored to local-markdown:notes as note-1776052527043.md
+```
+
+```bash
+brv swarm curate "Architecture uses event sourcing" --provider gbrain
+```
+
+Output:
+```
+Stored to gbrain as concept/event-sourcing-architecture
+```
+
+**JSON output:**
+```bash
+brv swarm curate "Test content" --format json
+```
+
+Output:
+```json
+{
+  "id": "note-1776052594462.md",
+  "provider": "local-markdown:project-docs",
+  "success": true,
+  "latencyMs": 1
+}
+```
+
+**Flags:** `--provider <id>` (target specific provider), `--format json` (structured output).
+
+### 10. Swarm Status
+**Overview:** Check provider health and write targets before running swarm query or curate. Use this to verify which providers are available and operational.
+
+**Use this skill when:**
+- Before running `brv swarm query` or `brv swarm curate` to check available providers
+- Diagnosing why swarm results are missing from a specific provider
+
+```bash
+brv swarm status
+```
+
+Output:
+```
+Memory Swarm Health Check
+════════════════════════════════════════
+  ✓ ByteRover       context-tree (always on)
+  ✓ Obsidian        /Users/you/Documents/MyObsidian
+  ✓ Local .md       1 folder(s)
+  ✓ GBrain          /Users/you/workspaces/gbrain
+  ✓ Memory Wiki     /Users/you/.openclaw/wiki/main
+
+Write Targets:
+  gbrain (entity, general)
+  local-markdown:project-docs (note, general)
+
+Swarm is operational (5/5 providers configured).
+```
+
+### 11. Query and Curate History
+**Overview:** Inspect past query and curate operations. Use `brv query-log view` to review query history, `brv curate view` to review curate history, and `brv query-log summary` to see aggregated recall metrics. Supports filtering by time, status, tier, and detailed per-operation output.
+
+**Use this skill when:**
+- You want to review what was queried or curated previously
+- You need to inspect a specific operation by logId
+- You want to filter history by time window or completion status
+- You want to collect data for analysis or debugging
+- You want to know what knowledge was added, updated, or deleted over time
+- You want aggregated metrics on query recall, cache hit rate, or knowledge gaps
+
+**Do NOT use this skill when:**
+- You want to run a new query — use `brv query` instead
+- You want to curate new knowledge — use `brv curate` instead
+
+**View curate history:** to check past curations
+- Show recent entries (last 10)
+```bash
+brv curate view
+```
+- Full detail for a specific entry: all files and operations performed (logId is printed by `brv curate` on completion, e.g. `cur-1739700001000`)
+```bash
+brv curate view cur-1739700001000
+```
+- List entries with file operations visible (no logId needed)
+```bash
+brv curate view --detail
+```
+- Filter by time and status
+```bash
+brv curate view --since 1h --status completed --limit 1000
+```
+- For all filter options
+```bash
+brv curate view --help
+```
+
+**View query history:** to check past queries
+- Show recent entries (last 10)
+```bash
+brv query-log view
+```
+- Full detail for a specific entry: matched docs and search metadata (logId is printed by `brv query` on completion, e.g. `qry-1739700001000`)
+```bash
+brv query-log view qry-1739700001000
+```
+- List entries with matched docs visible (no logId needed)
+```bash
+brv query-log view --detail
+```
+- Filter by time, status, or resolution tier (0=exact cache, 1=fuzzy cache, 2=direct search, 3=optimized LLM, 4=full agentic)
+```bash
+brv query-log view --since 1h --status completed --limit 1000
+brv query-log view --tier 0 --tier 1
+```
+- For all filter options
+```bash
+brv query-log view --help
+```
+
+**View query recall metrics:** to see aggregated stats across recent queries
+- Summary for the last 24 hours (default)
+```bash
+brv query-log summary
+```
+- Summary for a specific time window
+```bash
+brv query-log summary --last 7d
+brv query-log summary --since 2026-04-01 --before 2026-04-03
+```
+- Narrative format (human-readable prose report)
+```bash
+brv query-log summary --format narrative
+```
+- For all options
+```bash
+brv query-log summary --help
 ```
 
 ## Data Handling

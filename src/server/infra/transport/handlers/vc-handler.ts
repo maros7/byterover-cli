@@ -3,7 +3,7 @@ import {join} from 'node:path'
 
 import type {ITokenStore} from '../../../core/interfaces/auth/i-token-store.js'
 import type {IContextTreeService} from '../../../core/interfaces/context-tree/i-context-tree-service.js'
-import type {GitCommit, IGitService} from '../../../core/interfaces/services/i-git-service.js'
+import type {GitCommit, GitDiffSide, IGitService} from '../../../core/interfaces/services/i-git-service.js'
 import type {ISpaceService} from '../../../core/interfaces/services/i-space-service.js'
 import type {ITeamService} from '../../../core/interfaces/services/i-team-service.js'
 import type {IProjectConfigStore} from '../../../core/interfaces/storage/i-project-config-store.js'
@@ -24,6 +24,13 @@ import {
   type IVcCommitResponse,
   type IVcConfigRequest,
   type IVcConfigResponse,
+  type IVcDiffFile,
+  type IVcDiffRequest,
+  type IVcDiffResponse,
+  type IVcDiffsRequest,
+  type IVcDiffsResponse,
+  type IVcDiscardRequest,
+  type IVcDiscardResponse,
   type IVcFetchRequest,
   type IVcFetchResponse,
   type IVcInitResponse,
@@ -40,18 +47,20 @@ import {
   type IVcResetRequest,
   type IVcResetResponse,
   type IVcStatusResponse,
+  type VcDiffFileStatus,
+  type VcDiffMode,
+  type VcDiffSide,
   VcErrorCode,
   type VcErrorCodeType,
   VcEvents,
   type VcResetMode,
 } from '../../../../shared/transport/events/vc-events.js'
-import {CONTEXT_TREE_GITIGNORE} from '../../../constants.js'
 import {BrvConfig} from '../../../core/domain/entities/brv-config.js'
 import {Space} from '../../../core/domain/entities/space.js'
 import {GitAuthError, GitError} from '../../../core/domain/errors/git-error.js'
 import {NotAuthenticatedError} from '../../../core/domain/errors/task-error.js'
 import {VcError} from '../../../core/domain/errors/vc-error.js'
-import {ensureGitignoreEntries} from '../../../utils/gitignore.js'
+import {ensureContextTreeGitignore, ensureGitignoreEntries} from '../../../utils/gitignore.js'
 import {buildCogitRemoteUrl, isValidBranchName, parseUserFacingUrl} from '../../git/cogit-url.js'
 import {type ProjectBroadcaster, type ProjectPathResolver, resolveRequiredProjectPath} from './handler-types.js'
 
@@ -80,6 +89,32 @@ function classifyIsomorphicGitError(error: unknown, notFoundCode: VcErrorCodeTyp
 const FIELD_MAP: Record<string, 'email' | 'name'> = {
   'user.email': 'email',
   'user.name': 'name',
+}
+
+function inferStatus(oldExists: boolean, newExists: boolean): VcDiffFileStatus {
+  if (!oldExists && newExists) return 'added'
+  if (oldExists && !newExists) return 'deleted'
+  return 'modified'
+}
+
+function resolveDiffSides(mode: VcDiffMode): {from: GitDiffSide; to: GitDiffSide} {
+  switch (mode.kind) {
+    case 'range': {
+      return {from: {commitish: mode.from}, to: {commitish: mode.to}}
+    }
+
+    case 'ref-vs-worktree': {
+      return {from: {commitish: mode.ref}, to: 'WORKDIR'}
+    }
+
+    case 'staged': {
+      return {from: {commitish: 'HEAD'}, to: 'STAGE'}
+    }
+
+    case 'unstaged': {
+      return {from: 'STAGE', to: 'WORKDIR'}
+    }
+  }
 }
 
 export interface IVcHandlerDeps {
@@ -148,6 +183,15 @@ export class VcHandler {
     this.transport.onRequest<IVcConfigRequest, IVcConfigResponse>(VcEvents.CONFIG, (data, clientId) =>
       this.handleConfig(data, clientId),
     )
+    this.transport.onRequest<IVcDiffRequest, IVcDiffResponse>(VcEvents.DIFF, (data, clientId) =>
+      this.handleDiff(data, clientId),
+    )
+    this.transport.onRequest<IVcDiffsRequest, IVcDiffsResponse>(VcEvents.DIFFS, (data, clientId) =>
+      this.handleDiffs(data, clientId),
+    )
+    this.transport.onRequest<IVcDiscardRequest, IVcDiscardResponse>(VcEvents.DISCARD, (data, clientId) =>
+      this.handleDiscard(data, clientId),
+    )
     this.transport.onRequest<IVcFetchRequest, IVcFetchResponse>(VcEvents.FETCH, (data, clientId) =>
       this.handleFetch(data, clientId),
     )
@@ -189,6 +233,39 @@ export class VcHandler {
     return 'Run: brv vc config user.name <value> and brv vc config user.email <value>.'
   }
 
+  /**
+   * Builds a single diff entry for a changed file, or `undefined` when either required side
+   * is absent/binary (the caller filters these out to keep binaries out of diff output).
+   */
+  private async buildDiffFile(params: {
+    directory: string
+    from: GitDiffSide
+    path: string
+    status: VcDiffFileStatus
+    to: GitDiffSide
+  }): Promise<IVcDiffFile | undefined> {
+    const {directory, from, path, status, to} = params
+    const [oldSide, newSide] = await Promise.all([
+      status === 'added' ? undefined : this.readSideEntry(directory, from, path),
+      status === 'deleted' ? undefined : this.readSideEntry(directory, to, path),
+    ])
+
+    if (status !== 'added' && !oldSide) return undefined
+    if (status !== 'deleted' && !newSide) return undefined
+
+    const binary = (oldSide?.binary ?? false) || (newSide?.binary ?? false)
+    const result: IVcDiffFile = {
+      newContent: binary ? '' : (newSide?.content ?? ''),
+      oldContent: binary ? '' : (oldSide?.content ?? ''),
+      path,
+      status,
+    }
+    if (oldSide) result.oldOid = oldSide.oid
+    if (newSide) result.newOid = newSide.oid
+    if (binary) result.binary = true
+    return result
+  }
+
   private buildNoRemoteMessage(nextStep: string): string {
     return (
       `No remote configured.\n\nTo connect to cloud:\n` +
@@ -199,16 +276,21 @@ export class VcHandler {
     )
   }
 
-  /**
-   * Writes a .gitignore to the context-tree directory only if one does not already exist.
-   */
-  private async ensureGitignore(contextTreeDir: string): Promise<void> {
-    const gitignorePath = join(contextTreeDir, '.gitignore')
-    try {
-      await fs.promises.access(gitignorePath)
-    } catch {
-      await fs.promises.writeFile(gitignorePath, CONTEXT_TREE_GITIGNORE, 'utf8')
+  private async computeDiff(directory: string, path: string, side: VcDiffSide): Promise<IVcDiffResponse> {
+    if (side === 'staged') {
+      const [head, stage] = await Promise.all([
+        this.gitService.getBlobContent({directory, path, ref: {commitish: 'HEAD'}}),
+        this.gitService.getBlobContent({directory, path, ref: 'STAGE'}),
+      ])
+      return {newContent: stage ?? '', oldContent: head ?? '', path}
     }
+
+    // unstaged: compare index (old) against working tree (new)
+    const [stage, workingTree] = await Promise.all([
+      this.gitService.getBlobContent({directory, path, ref: 'STAGE'}),
+      fs.promises.readFile(join(directory, path), 'utf8').catch(() => ''),
+    ])
+    return {newContent: workingTree, oldContent: stage ?? '', path}
   }
 
   /**
@@ -229,6 +311,27 @@ export class VcHandler {
     }
   }
 
+  /**
+   * Block a commit when either:
+   *  1. The index still has unmerged (multi-stage) entries — matches native git's commit guard.
+   *  2. Any tracked file still contains `<<<<<<<` markers — extra strictness on top of native git,
+   *     matching our existing push-time guard. Avoids accidentally publishing marker text.
+   */
+  private async guardUnmergedAndMarkers(directory: string): Promise<void> {
+    const conflicts = await this.gitService.getConflicts({directory})
+    if (conflicts.length > 0) {
+      throw new VcError('Committing is not possible because you have unmerged files.', VcErrorCode.MERGE_CONFLICT)
+    }
+
+    const markerFiles = await this.gitService.getFilesWithConflictMarkers({directory})
+    if (markerFiles.length > 0) {
+      throw new VcError(
+        `Conflict markers detected in: ${markerFiles.join(', ')}. Resolve them before committing.`,
+        VcErrorCode.CONFLICT_MARKERS_PRESENT,
+      )
+    }
+  }
+
   private async handleAdd(data: IVcAddRequest, clientId: string): Promise<IVcAddResponse> {
     const projectPath = resolveRequiredProjectPath(this.resolveProjectPath, clientId)
     const directory = this.contextTreeService.resolvePath(projectPath)
@@ -237,6 +340,8 @@ export class VcHandler {
     if (!gitInitialized) {
       throw new VcError('ByteRover version control not initialized.', VcErrorCode.GIT_NOT_INITIALIZED)
     }
+
+    await ensureContextTreeGitignore(directory)
 
     const statusBefore = await this.gitService.status({directory})
     const stagedBefore = new Set(statusBefore.files.filter((f) => f.staged).map((f) => f.path))
@@ -267,7 +372,7 @@ export class VcHandler {
     // but transport payloads are untrusted — validate at the boundary.
     if (data.action === 'create' || data.action === 'delete') {
       if (!data.name) throw new VcError('Branch name is required.', VcErrorCode.INVALID_BRANCH_NAME)
-      if (data.action === 'create') return this.handleBranchCreate(directory, data.name)
+      if (data.action === 'create') return this.handleBranchCreate(directory, data.name, data.startPoint)
       return this.handleBranchDelete(directory, data.name)
     }
 
@@ -278,7 +383,7 @@ export class VcHandler {
     throw new VcError(`Unknown branch action.`, VcErrorCode.INVALID_ACTION)
   }
 
-  private async handleBranchCreate(directory: string, name: string): Promise<IVcBranchResponse> {
+  private async handleBranchCreate(directory: string, name: string, startPoint?: string): Promise<IVcBranchResponse> {
     if (!isValidBranchName(name)) {
       throw new VcError(`Invalid branch name: '${name}'.`, VcErrorCode.INVALID_BRANCH_NAME)
     }
@@ -294,7 +399,16 @@ export class VcHandler {
       throw new VcError('You must make an initial commit before creating branches.', VcErrorCode.NO_COMMITS)
     }
 
-    await this.gitService.createBranch({branch: name, directory})
+    try {
+      await this.gitService.createBranch({branch: name, directory, startPoint})
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'NotFoundError') {
+        throw new VcError(`Start point '${startPoint}' not found.`, VcErrorCode.BRANCH_NOT_FOUND)
+      }
+
+      throw error
+    }
+
     return {action: 'create', created: name}
   }
 
@@ -391,6 +505,13 @@ export class VcHandler {
 
     this.validateBranchName(data.branch)
 
+    if (data.startPoint !== undefined && !data.create) {
+      throw new VcError(
+        'Use New Branch to create a branch from a starting point. Checkout only switches to an existing branch.',
+        VcErrorCode.INVALID_ACTION,
+      )
+    }
+
     // ── Phase 2: Resolve current branch ──
     const previousBranch = await this.gitService.getCurrentBranch({directory})
 
@@ -401,7 +522,21 @@ export class VcHandler {
         throw new VcError(`Branch '${data.branch}' already exists.`, VcErrorCode.BRANCH_ALREADY_EXISTS)
       }
 
-      await this.gitService.createBranch({branch: data.branch, checkout: true, directory})
+      try {
+        await this.gitService.createBranch({
+          branch: data.branch,
+          checkout: true,
+          directory,
+          startPoint: data.startPoint,
+        })
+      } catch (error) {
+        if (error instanceof Error && 'code' in error && error.code === 'NotFoundError') {
+          throw new VcError(`Start point '${data.startPoint}' not found.`, VcErrorCode.BRANCH_NOT_FOUND)
+        }
+
+        throw error
+      }
+
       return {branch: data.branch, created: true, previousBranch}
     }
 
@@ -458,7 +593,15 @@ export class VcHandler {
       await fs.promises.rm(join(contextTreeDir, '.gitignore'), {force: true}).catch(() => {})
     }
 
-    const {spaceId, spaceName, spaceSlug, teamId, teamName, teamSlug, url: cloneUrl} = await this.resolveCloneInput(data)
+    const {
+      spaceId,
+      spaceName,
+      spaceSlug,
+      teamId,
+      teamName,
+      teamSlug,
+      url: cloneUrl,
+    } = await this.resolveCloneInput(data)
     const label = teamName && spaceName ? `${teamName}/${spaceName}` : 'repository'
 
     try {
@@ -510,7 +653,7 @@ export class VcHandler {
       }
 
       // Ensure .gitignore exists (remote may not have one)
-      await this.ensureGitignore(contextTreeDir)
+      await ensureContextTreeGitignore(contextTreeDir)
 
       // Add .brv entries to project .gitignore (prevents `git add .` fatal error from nested .git)
       await ensureGitignoreEntries(projectPath)
@@ -551,6 +694,8 @@ export class VcHandler {
       throw new VcError('Nothing staged.', VcErrorCode.NOTHING_STAGED)
     }
 
+    await this.guardUnmergedAndMarkers(directory)
+
     const config = await this.vcGitConfigStore.get(projectPath)
     if (!config?.name || !config.email) {
       const hint = await this.buildAuthorHint(config)
@@ -590,6 +735,123 @@ export class VcHandler {
     }
 
     return {key: data.key, value}
+  }
+
+  private async handleDiff(data: IVcDiffRequest, clientId: string): Promise<IVcDiffResponse> {
+    const projectPath = resolveRequiredProjectPath(this.resolveProjectPath, clientId)
+    const directory = this.contextTreeService.resolvePath(projectPath)
+
+    const gitInitialized = await this.gitService.isInitialized({directory})
+    if (!gitInitialized) {
+      throw new VcError('ByteRover version control not initialized.', VcErrorCode.GIT_NOT_INITIALIZED)
+    }
+
+    return this.computeDiff(directory, data.path, data.side)
+  }
+
+  private async handleDiffs(data: IVcDiffsRequest, clientId: string): Promise<IVcDiffsResponse> {
+    const projectPath = resolveRequiredProjectPath(this.resolveProjectPath, clientId)
+    const directory = this.contextTreeService.resolvePath(projectPath)
+
+    const gitInitialized = await this.gitService.isInitialized({directory})
+    if (!gitInitialized) {
+      throw new VcError('ByteRover version control not initialized.', VcErrorCode.GIT_NOT_INITIALIZED)
+    }
+
+    // Mode-based call (CLI/TUI): auto-discover changed files + return full IVcDiffFile entries.
+    // Binary or unreadable files are dropped by buildDiffFile (returns undefined).
+    if ('mode' in data) {
+      const {from, to} = resolveDiffSides(data.mode)
+      try {
+        const changed = await this.gitService.listChangedFiles({directory, from, to})
+        const entries = await Promise.all(
+          changed.map((change) => this.buildDiffFile({directory, from, path: change.path, status: change.status, to})),
+        )
+        const diffs = entries.filter((d): d is IVcDiffFile => d !== undefined)
+        return {diffs, mode: data.mode}
+      } catch (error) {
+        const classified = classifyIsomorphicGitError(error, VcErrorCode.INVALID_REF)
+        if (classified) throw classified
+        throw error
+      }
+    }
+
+    // WebUI call: caller-supplied paths + side. Status is derived from blob presence,
+    // so an empty-blob edit is correctly reported as `modified`, not `added`.
+    const {paths, side} = data
+
+    if (side === 'staged') {
+      const [head, stage] = await Promise.all([
+        this.gitService.getBlobContents({directory, paths, ref: {commitish: 'HEAD'}}),
+        this.gitService.getBlobContents({directory, paths, ref: 'STAGE'}),
+      ])
+      const diffs = paths.map((path) => {
+        const oldBlob = head[path]
+        const newBlob = stage[path]
+        return {
+          newContent: newBlob ?? '',
+          oldContent: oldBlob ?? '',
+          path,
+          status: inferStatus(oldBlob !== undefined, newBlob !== undefined),
+        }
+      })
+      return {diffs}
+    }
+
+    // unstaged: compare index (old) against working tree (new)
+    const stage = await this.gitService.getBlobContents({directory, paths, ref: 'STAGE'})
+    const workingTree = await Promise.all(
+      paths.map(async (path): Promise<string | undefined> => {
+        try {
+          return await fs.promises.readFile(join(directory, path), 'utf8')
+        } catch {
+          return undefined
+        }
+      }),
+    )
+    const diffs = paths.map((path, i) => {
+      const oldBlob = stage[path]
+      const newFile = workingTree[i]
+      return {
+        newContent: newFile ?? '',
+        oldContent: oldBlob ?? '',
+        path,
+        status: inferStatus(oldBlob !== undefined, newFile !== undefined),
+      }
+    })
+    return {diffs}
+  }
+
+  private async handleDiscard(data: IVcDiscardRequest, clientId: string): Promise<IVcDiscardResponse> {
+    const projectPath = resolveRequiredProjectPath(this.resolveProjectPath, clientId)
+    const directory = this.contextTreeService.resolvePath(projectPath)
+
+    const gitInitialized = await this.gitService.isInitialized({directory})
+    if (!gitInitialized) {
+      throw new VcError('ByteRover version control not initialized.', VcErrorCode.GIT_NOT_INITIALIZED)
+    }
+
+    const {filePaths} = data
+    // Prefer index blob (preserves staged changes); fall back to HEAD; else delete (untracked).
+    const [stage, head] = await Promise.all([
+      this.gitService.getBlobContents({directory, paths: filePaths, ref: 'STAGE'}),
+      this.gitService.getBlobContents({directory, paths: filePaths, ref: {commitish: 'HEAD'}}),
+    ])
+
+    const results = await Promise.all(
+      filePaths.map(async (path) => {
+        const target = stage[path] ?? head[path]
+        const absolutePath = join(directory, path)
+        try {
+          await (target === undefined ? fs.promises.unlink(absolutePath) : fs.promises.writeFile(absolutePath, target))
+          return true
+        } catch {
+          return false
+        }
+      }),
+    )
+
+    return {count: results.filter(Boolean).length}
   }
 
   private async handleFetch(data: IVcFetchRequest, clientId: string): Promise<IVcFetchResponse> {
@@ -639,7 +901,7 @@ export class VcHandler {
     await this.gitService.init({defaultBranch: 'main', directory: contextTreeDir})
 
     // 3. Ensure .gitignore exists with correct content (idempotent)
-    await this.ensureGitignore(contextTreeDir)
+    await ensureContextTreeGitignore(contextTreeDir)
 
     // 4. Add .brv entries to project .gitignore (prevents `git add .` fatal error from nested .git)
     await ensureGitignoreEntries(projectPath)
@@ -720,11 +982,7 @@ export class VcHandler {
         return {action: 'continue', defaultMessage}
       }
 
-      // Check for unresolved conflicts before committing
-      const conflicts = await this.gitService.getConflicts({directory})
-      if (conflicts.length > 0) {
-        throw new VcError('Committing is not possible because you have unmerged files.', VcErrorCode.MERGE_CONFLICT)
-      }
+      await this.guardUnmergedAndMarkers(directory)
 
       const config = await this.vcGitConfigStore.get(projectPath)
       if (!config?.name || !config.email) {
@@ -961,6 +1219,30 @@ export class VcHandler {
       return {action: 'show', url: url ? maskCredentialsInUrl(url) : undefined}
     }
 
+    if (data.subcommand === 'remove') {
+      const existingUrl = await this.gitService.getRemoteUrl({directory, remote: 'origin'})
+      if (!existingUrl) {
+        throw new VcError("No remote 'origin' to remove.", VcErrorCode.NO_REMOTE)
+      }
+
+      // Clear config before removing the remote so a mid-way failure leaves a retry-friendly state:
+      // if removeRemote throws, config is already cleared and remote is still present, so
+      // re-running `remove` will retry removeRemote and succeed. The reverse order leaves the
+      // remote gone but config stale, and the next `remove` fails with NO_REMOTE — unrecoverable.
+      const existingConfig = await this.projectConfigStore.read(projectPath)
+      if (existingConfig) {
+        await this.projectConfigStore.write(existingConfig.withoutSpace(), projectPath)
+      }
+
+      await this.gitService.removeRemote({directory, remote: 'origin'})
+
+      return {action: 'remove'}
+    }
+
+    if (data.subcommand !== 'add' && data.subcommand !== 'set-url') {
+      throw new VcError('Unknown remote subcommand.', VcErrorCode.INVALID_ACTION)
+    }
+
     if (!data.url) {
       throw new VcError('URL is required.', VcErrorCode.INVALID_REMOTE_URL)
     }
@@ -1085,6 +1367,8 @@ export class VcHandler {
       }
     }
 
+    await ensureContextTreeGitignore(contextTreeDir)
+
     const branch = await this.gitService.getCurrentBranch({directory: contextTreeDir})
     const gitStatus = await this.gitService.status({directory: contextTreeDir})
 
@@ -1151,6 +1435,32 @@ export class VcHandler {
       },
       untracked: gitStatus.files.filter((f) => f.status === 'untracked').map((f) => f.path),
     }
+  }
+
+  /**
+   * Reads a diff side's content + short oid in a single pass. Returns `undefined`
+   * only when the blob is absent on disk / at the ref. Binary content (NUL byte)
+   * is marked via `binary: true` so the caller can emit `Binary files ... differ`.
+   */
+  private async readSideEntry(
+    directory: string,
+    side: GitDiffSide,
+    path: string,
+  ): Promise<undefined | {binary?: boolean; content: string; oid: string}> {
+    if (side === 'WORKDIR') {
+      let buf: Buffer
+      try {
+        buf = await fs.promises.readFile(join(directory, path))
+      } catch {
+        return undefined
+      }
+
+      const oid = await this.gitService.hashBlob(buf)
+      if (buf.includes(0)) return {binary: true, content: '', oid}
+      return {content: buf.toString('utf8'), oid}
+    }
+
+    return this.gitService.getTextBlob({directory, path, ref: side})
   }
 
   /**
@@ -1310,7 +1620,15 @@ export class VcHandler {
   private async resolveTeamSpaceNames(
     teamSlug: string,
     spaceSlug: string,
-  ): Promise<{spaceId: string; spaceName: string; spaceSlug: string; teamId: string; teamName: string; teamSlug: string; url: string}> {
+  ): Promise<{
+    spaceId: string
+    spaceName: string
+    spaceSlug: string
+    teamId: string
+    teamName: string
+    teamSlug: string
+    url: string
+  }> {
     const token = await this.tokenStore.load()
     if (!token?.isValid()) throw new NotAuthenticatedError()
 
